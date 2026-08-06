@@ -408,7 +408,14 @@ static bool ds4_backend_supports_ssd_streaming(ds4_backend backend) {
     return false;
 }
 
-static bool ds4_backend_supports_streaming_auto_cache(ds4_backend backend) {
+/* Whether the streaming routed-expert cache comes out of the same memory as the
+ * graph's context and KV buffers. Metal and ROCm/Strix are unified-memory, so
+ * there is one pool: the engine both sizes the cache against the graph working
+ * set and must leave room in it for the context. A discrete CUDA GPU instead
+ * pins the cache in host RAM, where nothing it holds competes with VRAM; there
+ * the backend bounds it against system RAM itself and the engine must keep its
+ * VRAM arithmetic away from it. */
+static bool ds4_backend_expert_cache_shares_graph_memory(ds4_backend backend) {
     if (backend == DS4_BACKEND_METAL) return true;
 #ifdef DS4_ROCM_BUILD
     if (backend == DS4_BACKEND_CUDA) return true;
@@ -4697,6 +4704,16 @@ static uint64_t ds4_streaming_manual_cache_safe_bytes(
     (void)ssd_streaming;
     return 0;
 #else
+    /*
+     * A host-resident cache is not in this budget at all: the backend clamps it
+     * against system RAM when it pins the slab. Subtracting VRAM context
+     * buffers from a VRAM working set would then shrink a host-RAM allocation
+     * as the context grows, for no reason — measured on a 12 GiB card with an
+     * 8 GiB budget, -c 8192 -> -c 150000 took the cache from 701 to 549 slots
+     * and 59.0% to 53.6% hit, purely as a side effect of the KV reservation.
+     */
+    if (!ds4_backend_expert_cache_shares_graph_memory(backend)) return 0;
+
     const uint64_t gib = 1024ull * 1024ull * 1024ull;
     const uint64_t recommended = ds4_gpu_recommended_working_set_size();
     if (recommended == 0) return 0;
@@ -55368,7 +55385,11 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
         e->ssd_streaming_cache_bytes != 0) {
         return true;
     }
-    if (!ds4_backend_supports_streaming_auto_cache(e->backend)) {
+    /* Auto planning exists for the backends whose cache shares the graph pool,
+     * because only then does the graph working set say anything about how large
+     * the cache may be. Elsewhere the backend sizes its own host-resident
+     * cache, and an unset budget is how the engine says so. */
+    if (!ds4_backend_expert_cache_shares_graph_memory(e->backend)) {
         return true;
     }
 
