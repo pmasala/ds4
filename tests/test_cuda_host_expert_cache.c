@@ -164,7 +164,7 @@ static void scenario_active(void) {
     expect(ok, "ample RAM: every selected load succeeds", log);
     expect(strstr(log, "GiB pinned") != NULL,
            "ample RAM: reports how much it pinned", log);
-    expect(strstr(log, "hits,") != NULL,
+    expect(strstr(log, " lookups ") != NULL,
            "ample RAM: the cache was consulted", log);
     expect(strstr(log, "using SSD reads") == NULL,
            "ample RAM: does not claim a fallback", log);
@@ -199,7 +199,7 @@ static void scenario_opt_out(void) {
     expect(ok, "opt-out: loads succeed on the plain SSD path", log);
     expect(strstr(log, "GiB pinned") == NULL,
            "opt-out: nothing is pinned", log);
-    expect(strstr(log, "hits,") == NULL,
+    expect(strstr(log, " lookups ") == NULL,
            "opt-out: the cache is never consulted", log);
     free(log);
 }
@@ -238,7 +238,7 @@ static void scenario_boosted_layer_bypass(void) {
     expect(ok, "boosted layer: loads succeed", log);
     expect(strstr(log, "GiB pinned") != NULL,
            "boosted layer: the arena still exists for the other layers", log);
-    expect(strstr(log, "hits,") == NULL,
+    expect(strstr(log, " lookups ") == NULL,
            "boosted layer: bypasses the cache entirely", log);
     free(log);
 }
@@ -249,7 +249,7 @@ static void scenario_glm(void) {
     expect(ok, "GLM: loads succeed", log);
     expect(strstr(log, "GiB pinned") == NULL,
            "GLM: the cache is not allocated", log);
-    expect(strstr(log, "hits,") == NULL,
+    expect(strstr(log, " lookups ") == NULL,
            "GLM: the cache is not consulted", log);
     free(log);
 }
@@ -315,7 +315,7 @@ static void scenario_churn(void) {
     ds4_gpu_set_ssd_streaming(false);
     char *log = cap_end();
     expect(ok, "churn: every evicting load succeeds", log);
-    expect(strstr(log, "hits,") != NULL, "churn: the cache stayed engaged", log);
+    expect(strstr(log, " lookups ") != NULL, "churn: the cache stayed engaged", log);
     free(log);
 }
 

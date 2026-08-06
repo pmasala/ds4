@@ -212,20 +212,57 @@ typedef struct {
 
 static cuda_host_expert_cache g_host_experts;
 
+/* Read work the loader actually issued, counted in cuda_expert_read_run.
+ *
+ * Kept separate from the hit rate on purpose, because the two are not the same
+ * measurement: a hit only removes a read if it removes that expert from the
+ * layer's miss list, so a cache can raise its hit count without issuing one
+ * read less. Reads per token is the number that has to move for a cache tier to
+ * be worth its RAM, so report it directly instead of inferring it. Reader
+ * threads increment these, hence the atomics. */
+static uint64_t g_expert_read_calls;
+static uint64_t g_expert_read_bytes;
+
+/* One line for the whole streamed-expert load path: what the cache saw and what
+ * the SSD was still asked for, over the same tokens. Printed with the cache off
+ * too, where it is the baseline the cache has to beat. */
+static void cuda_expert_load_report(void) {
+    const uint64_t seen = g_host_experts.hits + g_host_experts.misses;
+    const uint64_t calls = __atomic_load_n(&g_expert_read_calls, __ATOMIC_RELAXED);
+    const uint64_t bytes = __atomic_load_n(&g_expert_read_bytes, __ATOMIC_RELAXED);
+    if (seen == 0 && calls == 0) return;
+    const double tokens = g_host_experts.decode_tokens ?
+                          (double)g_host_experts.decode_tokens : 1.0;
+    /* The cache clause appears only when the cache was actually consulted, so
+     * its absence is the signal that the reads below are the uncached path. */
+    char cache[160];
+    cache[0] = '\0';
+    if (seen != 0) {
+        snprintf(cache, sizeof(cache),
+                 "cache %llu hits / %llu lookups (%.1f%% hit, %u/%u slots), ",
+                 (unsigned long long)g_host_experts.hits,
+                 (unsigned long long)seen,
+                 100.0 * (double)g_host_experts.hits / (double)seen,
+                 g_host_experts.used, g_host_experts.cap);
+    }
+    fprintf(stderr,
+            "ds4: CUDA streamed experts over %llu decode tokens: %sreads %llu "
+            "(%.1f/token, %.2f MiB/token, %.2f GiB total)\n",
+            (unsigned long long)g_host_experts.decode_tokens,
+            cache,
+            (unsigned long long)calls,
+            (double)calls / tokens,
+            (double)bytes / tokens / 1048576.0,
+            (double)bytes / 1073741824.0);
+}
+
 /* Drop the cached CONTENT but keep the pinned arena. Called when the model
  * mapping changes: the bytes may be stale, but the arena geometry is engine
  * configuration and the pin cost is worth keeping across an engine open. */
 static void cuda_host_experts_flush(void) {
-    const uint64_t seen = g_host_experts.hits + g_host_experts.misses;
-    if (seen > 0) {
-        fprintf(stderr,
-                "ds4: CUDA host expert cache: %llu hits, %llu misses "
-                "(%.1f%% hit), %u/%u slots used\n",
-                (unsigned long long)g_host_experts.hits,
-                (unsigned long long)g_host_experts.misses,
-                100.0 * (double)g_host_experts.hits / (double)seen,
-                g_host_experts.used, g_host_experts.cap);
-    }
+    cuda_expert_load_report();
+    __atomic_store_n(&g_expert_read_calls, 0ull, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_expert_read_bytes, 0ull, __ATOMIC_RELAXED);
     g_host_experts.n_total = 0;
     g_host_experts.used = 0;
     g_host_experts.clock = 0;
@@ -399,7 +436,12 @@ static int cuda_host_experts_ensure_maps(uint32_t layer) {
 /* Token accounting drives the hotness decay: layers arrive in increasing order
  * within one token, so a non-increasing layer index marks the next token.
  * (Metal counts tokens explicitly at its dispatch site; the CUDA selected-load
- * path only sees routed layers, hence the wrap heuristic.) */
+ * path only sees routed layers, hence the wrap heuristic.)
+ *
+ * Called for every streamed decode token, not only when the cache is in use:
+ * it is also the denominator of the read-work report, which has to exist for
+ * the cache-off baseline. The hotness decay below is a no-op then, because an
+ * unused cache has no hotness rows. */
 static void cuda_host_experts_note_token(uint32_t layer) {
     if (layer <= g_host_experts.last_layer &&
         g_host_experts.decode_tokens != UINT64_MAX) {
@@ -412,16 +454,8 @@ static void cuda_host_experts_note_token(uint32_t layer) {
         static int verbose = -1;
         if (verbose < 0)
             verbose = getenv("DS4_CUDA_HOST_EXPERT_CACHE_VERBOSE") != NULL;
-        const uint64_t seen = g_host_experts.hits + g_host_experts.misses;
-        if (verbose && seen > 0 &&
-            (g_host_experts.decode_tokens % 64u) == 0u) {
-            fprintf(stderr,
-                    "ds4: CUDA host expert cache: %.1f%% hit over %llu lookups "
-                    "(%u/%u slots)\n",
-                    100.0 * (double)g_host_experts.hits / (double)seen,
-                    (unsigned long long)seen,
-                    g_host_experts.used, g_host_experts.cap);
-        }
+        if (verbose && (g_host_experts.decode_tokens % 64u) == 0u)
+            cuda_expert_load_report();
     }
     g_host_experts.last_layer = layer;
 }
@@ -2480,6 +2514,7 @@ typedef struct {
     uint64_t    model_size;
     const char *payload;     /* stage + O_DIRECT alignment delta; reader sets */
     int         status;      /* 0 pending, 1 done, -1 failed */
+    int         decode;      /* count this read against the per-token report */
 } cuda_expert_read_job;
 
 enum { DS4_CUDA_EXPERT_READ_MAX_THREADS = 16 };
@@ -2497,8 +2532,14 @@ static uint32_t  g_expert_read_next;
 static uint32_t  g_expert_read_completed;
 
 /* The whole of one job, shared by the reader threads and by the inline
- * fallback the caller uses when no thread could be started. */
+ * fallback the caller uses when no thread could be started. This is also the
+ * one funnel every expert range passes through, so it is where the read work
+ * is counted (see g_expert_read_calls). */
 static int cuda_expert_read_run(cuda_expert_read_job *job) {
+    if (job->decode) {
+        __atomic_fetch_add(&g_expert_read_calls, 1ull, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&g_expert_read_bytes, job->bytes, __ATOMIC_RELAXED);
+    }
     const char *payload = NULL;
     if (!cuda_model_stage_read(job->stage, g_stream_stage_slot_bytes,
                                job->offset, job->bytes, &payload)) {
@@ -26797,6 +26838,7 @@ static int cuda_stream_selected_cache_begin_load(
                     job.mirror = mirror ? mirror + mirror_at[r] + at : NULL;
                     job.model_map = table->model_map;
                     job.model_size = table->model_size;
+                    job.decode = decode;
                     jobs.push_back(job);   /* reserved above, cannot throw */
                 }
             }
@@ -26847,19 +26889,28 @@ static int cuda_stream_selected_cache_begin_load(
         return 0;
     }
     /* Publish the host-cache mappings only now that the slots hold good bytes:
-     * a failed load can never leave a key pointing at stale ones. */
-    for (size_t m = 0; m < miss_slot.size(); m++) {
-        if (miss_slot[m] < 0) continue;
-        const size_t key = (size_t)table->layer * n_total +
-                           (uint32_t)compact_ids[miss_compact[m]];
-        g_host_experts.slot_key[miss_slot[m]] = (int32_t)key;
-        g_host_experts.slot_of[key] = miss_slot[m];
-        g_host_experts.misses++;
+     * a failed load can never leave a key pointing at stale ones. Every miss
+     * counts, including one that found no free slot in this call: those are
+     * still lookups the cache did not serve, and dropping them from the
+     * denominator would report a hit rate the cache never earned. */
+    if (use_host) {
+        for (size_t m = 0; m < miss_slot.size(); m++) {
+            g_host_experts.misses++;
+            if (miss_slot[m] < 0) continue;
+            const size_t key = (size_t)table->layer * n_total +
+                               (uint32_t)compact_ids[miss_compact[m]];
+            g_host_experts.slot_key[miss_slot[m]] = (int32_t)key;
+            g_host_experts.slot_of[key] = miss_slot[m];
+        }
     }
+    /* A token boundary is also the denominator of the read-work report, so it
+     * is counted for every decode token, not only the ones the cache served.
+     * Batch prefill is excluded on purpose: it loads whole layers, so counting
+     * its chunks as tokens would make reads/token mean two different things. */
+    if (decode) cuda_host_experts_note_token(table->layer);
     /* Account route hotness only after the whole load succeeded, so the
      * caller's synchronous retry of a failed load cannot double-count. */
     if (use_host) {
-        cuda_host_experts_note_token(table->layer);
         for (uint32_t i = 0; i < slot_count; i++)
             cuda_host_experts_note_hotness(
                     (size_t)table->layer * n_total + (uint32_t)selected_ids[i], 1u);
