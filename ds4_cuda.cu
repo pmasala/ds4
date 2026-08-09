@@ -1202,8 +1202,10 @@ static uint64_t g_model_stage_bytes;
  * per call so that no slot is reused within a wave: the single upload-stream
  * sync that ends the wave is what releases every slot in it, which is why the
  * slots carry no per-slot event bookkeeping. */
-static char    *g_stream_stage_block;      /* the one pinned allocation */
+static char    *g_stream_stage_block;      /* shared mode: one pinned allocation */
 static char    *g_stream_stage_base;       /* O_DIRECT-aligned inside it */
+static char   **g_stream_stage_slot;       /* default: one pinned buffer per slot */
+static char   **g_stream_stage_slot_raw;   /* their allocations, for freeing */
 static uint32_t g_stream_stage_slots;
 static uint64_t g_stream_stage_slot_bytes;
 static cudaStream_t g_stream_selected_upload_stream;
@@ -3184,15 +3186,29 @@ static void cuda_expert_reads_drain(void) {
     pthread_mutex_unlock(&g_expert_read_mu);
 }
 
-static void cuda_stream_selected_stage_release(void) {
-    cuda_expert_readers_stop();
+static void cuda_stream_stage_free(void) {
     if (g_stream_stage_block) {
         (void)cudaFreeHost(g_stream_stage_block);
         g_stream_stage_block = NULL;
     }
     g_stream_stage_base = NULL;
+    if (g_stream_stage_slot_raw) {
+        for (uint32_t i = 0; i < g_stream_stage_slots; i++) {
+            if (g_stream_stage_slot_raw[i])
+                (void)cudaFreeHost(g_stream_stage_slot_raw[i]);
+        }
+    }
+    free(g_stream_stage_slot_raw);
+    free(g_stream_stage_slot);
+    g_stream_stage_slot_raw = NULL;
+    g_stream_stage_slot = NULL;
     g_stream_stage_slots = 0;
     g_stream_stage_slot_bytes = 0;
+}
+
+static void cuda_stream_selected_stage_release(void) {
+    cuda_expert_readers_stop();
+    cuda_stream_stage_free();
     if (g_stream_selected_upload_stream) {
         (void)cudaStreamDestroy(g_stream_selected_upload_stream);
         g_stream_selected_upload_stream = NULL;
@@ -3216,41 +3232,75 @@ static int cuda_stream_selected_upload_stream_ensure(void) {
     return 1;
 }
 
-/* Grow the staging arena to `slots` slots of `payload_bytes` usable each. One
- * pinned block keeps the pin count at one regardless of the slot count; each
+/* Grow the staging arena to `slots` slots of `payload_bytes` usable each; each
  * slot carries the O_DIRECT alignment slack the read may need in front of its
- * payload. Slots only ever grow, so steady-state decode never reallocates. */
+ * payload. Slots only ever grow, so steady-state decode never reallocates.
+ *
+ * Every slot is its own pinned allocation, deliberately. With one shared
+ * pinned block, an O_DIRECT pread DMA-writes slot k+1 while the GPU DMA-reads
+ * slot k out of the same allocation, and under WSL2's paravirtual GPU that
+ * combination occasionally delivered corrupted expert bytes — seen as
+ * run-to-run output divergence that vanished the moment the bytes were touched
+ * by the CPU in between, or the overlap was removed. Separate pins keep the
+ * two DMA targets in separate mappings at no cost to the queue depth.
+ * DS4_CUDA_EXPERT_STAGE_SHARED=1 restores the shared block for diagnosis. */
 static int cuda_stream_stage_ensure(uint32_t slots, uint64_t payload_bytes) {
     const uint64_t align = g_model_direct_align > 1 ? g_model_direct_align : 1;
     const uint64_t slot_bytes = cuda_round_up(payload_bytes + align, align);
-    if (g_stream_stage_block && g_stream_stage_slots >= slots &&
-        g_stream_stage_slot_bytes >= slot_bytes) {
+    const int shared = getenv("DS4_CUDA_EXPERT_STAGE_SHARED") != NULL;
+    if (g_stream_stage_slots >= slots &&
+        g_stream_stage_slot_bytes >= slot_bytes &&
+        (shared ? g_stream_stage_block != NULL : g_stream_stage_slot != NULL)) {
         return 1;
     }
-    if (slots > g_stream_stage_slots) g_stream_stage_slots = slots;
-    if (slot_bytes > g_stream_stage_slot_bytes)
-        g_stream_stage_slot_bytes = slot_bytes;
-    if (g_stream_stage_block) {
-        (void)cudaFreeHost(g_stream_stage_block);
-        g_stream_stage_block = NULL;
-        g_stream_stage_base = NULL;
+    const uint32_t want_slots =
+        slots > g_stream_stage_slots ? slots : g_stream_stage_slots;
+    const uint64_t want_bytes =
+        slot_bytes > g_stream_stage_slot_bytes ? slot_bytes
+                                               : g_stream_stage_slot_bytes;
+    cuda_stream_stage_free();
+    g_stream_stage_slots = want_slots;
+    g_stream_stage_slot_bytes = want_bytes;
+
+    if (shared) {
+        const uint64_t bytes = (uint64_t)want_slots * want_bytes + align;
+        cudaError_t err = cudaMallocHost((void **)&g_stream_stage_block,
+                                         (size_t)bytes);
+        if (err != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: CUDA streaming expert staging allocation failed for "
+                    "%.2f MiB: %s\n",
+                    (double)bytes / 1048576.0, cudaGetErrorString(err));
+            (void)cudaGetLastError();
+            cuda_stream_stage_free();
+            return 0;
+        }
+        g_stream_stage_base = (char *)cuda_align_ptr(g_stream_stage_block, align);
+        return 1;
     }
-    const uint64_t bytes =
-        (uint64_t)g_stream_stage_slots * g_stream_stage_slot_bytes + align;
-    cudaError_t err = cudaMallocHost((void **)&g_stream_stage_block,
-                                     (size_t)bytes);
-    if (err != cudaSuccess) {
-        fprintf(stderr,
-                "ds4: CUDA streaming expert staging allocation failed for "
-                "%.2f MiB: %s\n",
-                (double)bytes / 1048576.0, cudaGetErrorString(err));
-        (void)cudaGetLastError();
-        g_stream_stage_block = NULL;
-        g_stream_stage_slots = 0;
-        g_stream_stage_slot_bytes = 0;
+
+    g_stream_stage_slot = (char **)calloc(want_slots, sizeof(char *));
+    g_stream_stage_slot_raw = (char **)calloc(want_slots, sizeof(char *));
+    if (!g_stream_stage_slot || !g_stream_stage_slot_raw) {
+        cuda_stream_stage_free();
         return 0;
     }
-    g_stream_stage_base = (char *)cuda_align_ptr(g_stream_stage_block, align);
+    for (uint32_t i = 0; i < want_slots; i++) {
+        void *raw = NULL;
+        cudaError_t err = cudaMallocHost(&raw, (size_t)(want_bytes + align));
+        if (err != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: CUDA streaming expert staging allocation failed at "
+                    "slot %u of %u (%.2f MiB each): %s\n",
+                    i, want_slots, (double)want_bytes / 1048576.0,
+                    cudaGetErrorString(err));
+            (void)cudaGetLastError();
+            cuda_stream_stage_free();
+            return 0;
+        }
+        g_stream_stage_slot_raw[i] = (char *)raw;
+        g_stream_stage_slot[i] = (char *)cuda_align_ptr(raw, align);
+    }
     return 1;
 }
 
@@ -27442,8 +27492,10 @@ static int cuda_stream_selected_cache_begin_load(
                 const uint32_t n = jobs.size() - base < wave ?
                                    (uint32_t)(jobs.size() - base) : wave;
                 for (uint32_t k = 0; k < n; k++) {
-                    jobs[base + k].stage = g_stream_stage_base +
-                        (uint64_t)k * g_stream_stage_slot_bytes;
+                    jobs[base + k].stage = g_stream_stage_slot ?
+                        g_stream_stage_slot[k] :
+                        g_stream_stage_base +
+                            (uint64_t)k * g_stream_stage_slot_bytes;
                 }
                 ok = cuda_stream_expert_run_wave(&jobs[base], n);
                 /* The next wave reuses these slots, so the uploads out of them
