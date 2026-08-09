@@ -223,6 +223,102 @@ static cuda_host_expert_cache g_host_experts;
 static uint64_t g_expert_read_calls;
 static uint64_t g_expert_read_bytes;
 
+/* Bytes crossing PCIe into VRAM for routed experts, counted at both upload
+ * sites: the cache-hit copies out of the pinned slab and the staged upload of
+ * a miss. A hit changes where an expert is fetched FROM, not whether it is
+ * uploaded, so this total is expected to be independent of the hit rate - the
+ * whole point of measuring it is to confirm or kill that reading. */
+static uint64_t g_expert_h2d_bytes;
+
+/* Non-routed weight bytes re-uploaded through the model-range cache. At steady
+ * state this should be zero: the ranges are cached in VRAM and looked up by
+ * offset. A non-zero per-token figure means VRAM pressure is evicting backbone
+ * weights and decode is paying to re-fetch them, which no per-layer stage
+ * profile can see. */
+static uint64_t g_model_range_h2d_bytes;
+
+/* Wall time the decode thread spends blocked on the expert upload stream. The
+ * loader is built so those copies overlap the layer's compute; if this grows
+ * while the byte counts stay fixed, the overlap is what was lost, not work. */
+static double   g_expert_upload_wait_s;
+
+/* Measured host->device ceiling, GB/s, 0 until probed.
+ *
+ * Bytes per token only says how much work there is; what says how much room is
+ * left is that number against the bandwidth THIS machine actually delivers.
+ * Hard-coding a bus speed would make the report a statement about the developer's
+ * box, so probe it once with the exact shape the loader uses — one expert's
+ * gate/up/down out of pinned memory with a single sync — and report the floor it
+ * implies. Cheap enough (a few MiB, once) to run unconditionally. */
+static double g_pcie_h2d_gbps;
+
+static void cuda_probe_h2d_ceiling(uint64_t expert_bytes) {
+    if (g_pcie_h2d_gbps != 0.0 || expert_bytes == 0) return;
+    g_pcie_h2d_gbps = -1.0;              /* sticky: never probe twice */
+    void *host = NULL, *dev = NULL;
+    if (cudaMallocHost(&host, (size_t)expert_bytes) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return;
+    }
+    if (cudaMalloc(&dev, (size_t)expert_bytes) != cudaSuccess) {
+        (void)cudaGetLastError();
+        (void)cudaFreeHost(host);
+        return;
+    }
+    /* One warm-up pass, then time enough copies that the clock is not the
+     * measurement: the loader's own pattern is three ranges and one sync. */
+    for (int rep = 0; rep < 2; rep++) {
+        const int iters = rep == 0 ? 2 : 16;
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        for (int i = 0; i < iters; i++) {
+            (void)cudaMemcpyAsync(dev, host, (size_t)expert_bytes,
+                                  cudaMemcpyHostToDevice, 0);
+        }
+        if (cudaStreamSynchronize(0) != cudaSuccess) { (void)cudaGetLastError(); break; }
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        if (rep == 1) {
+            const double s = (double)(t1.tv_sec - t0.tv_sec) +
+                             (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
+            if (s > 0.0)
+                g_pcie_h2d_gbps = (double)expert_bytes * iters / s / 1e9;
+        }
+    }
+    (void)cudaFree(dev);
+    (void)cudaFreeHost(host);
+}
+
+
+/* Which exit of cuda_model_range_ptr serves each weight lookup, and how many
+ * bytes it hands out. Some exits return a DEVICE address (free to read) and some
+ * return a HOST address the kernel then reads over PCIe on every use. Summed over
+ * one decode token, the host exits give the bus traffic those reads imply — which
+ * is the traffic nvidia-smi reports and none of our other counters see. */
+enum {
+    DS4_RANGE_EXIT_TRIVIAL = 0,   /* bytes == 0 */
+    DS4_RANGE_EXIT_WHOLE_MAP,     /* device-owned or fully host-registered map */
+    DS4_RANGE_EXIT_HMM,           /* HMM direct: host address, GPU reads it */
+    DS4_RANGE_EXIT_DIRECT_ENV,    /* DS4_CUDA_DIRECT_MODEL */
+    DS4_RANGE_EXIT_CACHED,        /* hit in a VRAM-resident range */
+    DS4_RANGE_EXIT_REGISTERED,    /* mapped sub-range: host address */
+    DS4_RANGE_EXIT_FD,            /* read into VRAM */
+    DS4_RANGE_EXIT_MAPPED,        /* cudaHostRegisterMapped: host address */
+    DS4_RANGE_EXIT_COPIED,        /* cudaMalloc + memcpy into VRAM */
+    DS4_RANGE_EXIT_N
+};
+static const char *g_range_exit_name[DS4_RANGE_EXIT_N] = {
+    "trivial", "whole-map(HOST)", "hmm(HOST)", "direct-env(HOST)", "cached(vram)",
+    "registered(HOST)", "fd(vram)", "mapped(HOST)", "copied(vram)"
+};
+static const int g_range_exit_is_host[DS4_RANGE_EXIT_N] = {0,1,1,1,0,1,0,1,0};
+static uint64_t g_range_exit_calls[DS4_RANGE_EXIT_N];
+static uint64_t g_range_exit_bytes[DS4_RANGE_EXIT_N];
+
+static void cuda_range_exit_note(int which, uint64_t bytes) {
+    g_range_exit_calls[which]++;
+    g_range_exit_bytes[which] += bytes;
+}
+
 /* One line for the whole streamed-expert load path: what the cache saw and what
  * the SSD was still asked for, over the same tokens. Printed with the cache off
  * too, where it is the baseline the cache has to beat. */
@@ -245,16 +341,65 @@ static void cuda_expert_load_report(void) {
                  100.0 * (double)g_host_experts.hits / (double)seen,
                  g_host_experts.used, g_host_experts.cap);
     }
+    const uint64_t h2d = g_expert_h2d_bytes;
+    if (g_model_range_h2d_bytes != 0) {
+        fprintf(stderr,
+                "ds4: CUDA non-routed weight re-fetch: %.2f MiB/token "
+                "(%.2f GiB total) — backbone is being evicted\n",
+                (double)g_model_range_h2d_bytes / tokens / 1048576.0,
+                (double)g_model_range_h2d_bytes / 1073741824.0);
+    }
+    /* Which exit served each weight lookup is a diagnostic for one specific
+     * question — whether any weights ended up on the host side, where kernels
+     * would read them over PCIe every token. Useful when a machine is slower
+     * than its byte counts explain; noise otherwise. */
+    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE") != NULL) {
+        uint64_t host_b = 0;
+        for (int i = 0; i < DS4_RANGE_EXIT_N; i++) {
+            if (g_range_exit_calls[i] == 0) continue;
+            fprintf(stderr,
+                    "ds4:   weight lookups via %-17s %8llu calls  %8.2f MiB/token\n",
+                    g_range_exit_name[i],
+                    (unsigned long long)g_range_exit_calls[i],
+                    (double)g_range_exit_bytes[i] / tokens / 1048576.0);
+            if (g_range_exit_is_host[i]) host_b += g_range_exit_bytes[i];
+        }
+        if (host_b != 0) {
+            fprintf(stderr,
+                    "ds4:   -> %.2f MiB/token of weights live on the HOST side; "
+                    "kernels read them over PCIe\n",
+                    (double)host_b / tokens / 1048576.0);
+        }
+    }
+    fprintf(stderr,
+            "ds4: CUDA expert upload wait: %.1f ms/token (%.1f s total)\n",
+            g_expert_upload_wait_s * 1000.0 / tokens, g_expert_upload_wait_s);
+    /* Bytes per token against the bandwidth this machine actually delivers: the
+     * floor those bytes put under a token, and how much of it is still exposed
+     * rather than hidden behind compute. This is the number that transfers to
+     * another machine; the MiB and the ms on their own do not. */
+    if (g_pcie_h2d_gbps > 0.0 && h2d != 0) {
+        const double floor_ms =
+            (double)h2d / tokens / (g_pcie_h2d_gbps * 1e9) * 1000.0;
+        const double exposed_ms = g_expert_upload_wait_s * 1000.0 / tokens;
+        fprintf(stderr,
+                "ds4: CUDA PCIe ceiling %.1f GB/s measured -> %.1f ms/token floor "
+                "from expert traffic, %.0f%% of it still exposed\n",
+                g_pcie_h2d_gbps, floor_ms,
+                floor_ms > 0.0 ? 100.0 * exposed_ms / floor_ms : 0.0);
+    }
     fprintf(stderr,
             "ds4: CUDA streamed experts over %llu decode tokens: %sreads %llu "
-            "(%.1f/token, %.2f MiB/token, %.2f GiB total)\n",
+            "(%.1f/token, %.2f MiB/token), PCIe %.2f MiB/token (%.2f GiB total)\n",
             (unsigned long long)g_host_experts.decode_tokens,
             cache,
             (unsigned long long)calls,
             (double)calls / tokens,
             (double)bytes / tokens / 1048576.0,
-            (double)bytes / 1073741824.0);
+            (double)h2d / tokens / 1048576.0,
+            (double)h2d / 1073741824.0);
 }
+
 
 /* Drop the cached CONTENT but keep the pinned arena. Called when the model
  * mapping changes: the bytes may be stale, but the arena geometry is engine
@@ -263,6 +408,9 @@ static void cuda_host_experts_flush(void) {
     cuda_expert_load_report();
     __atomic_store_n(&g_expert_read_calls, 0ull, __ATOMIC_RELAXED);
     __atomic_store_n(&g_expert_read_bytes, 0ull, __ATOMIC_RELAXED);
+    g_expert_h2d_bytes = 0;   /* loader thread only, unlike the read counters */
+    g_model_range_h2d_bytes = 0;
+    g_expert_upload_wait_s = 0.0;
     g_host_experts.n_total = 0;
     g_host_experts.used = 0;
     g_host_experts.clock = 0;
@@ -446,6 +594,12 @@ static void cuda_host_experts_note_token(uint32_t layer) {
     if (layer <= g_host_experts.last_layer &&
         g_host_experts.decode_tokens != UINT64_MAX) {
         g_host_experts.decode_tokens++;
+        /* Decode has begun: drop the startup model load from the re-fetch
+         * counter so what it reports is per-token eviction, not warm-up. */
+        if (g_host_experts.decode_tokens == 1u) {
+            g_model_range_h2d_bytes = 0;
+            g_expert_upload_wait_s = 0.0;
+        }
         if (g_host_experts.decode_tokens %
             DS4_CUDA_HOST_EXPERT_HOTNESS_DECAY_TOKENS == 0u) {
             for (size_t i = 0; i < g_host_experts.hotness.size(); i++)
@@ -574,8 +728,6 @@ static int cuda_q4_mma_ok(void) {
     }
     return cached;
 }
-
-
 
 
 
@@ -1051,24 +1203,34 @@ static const char *cuda_model_ptr(const void *model_map, uint64_t offset) {
 }
 
 static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what) {
-    if (bytes == 0) return cuda_model_ptr(model_map, offset);
-    if (g_model_device_owned || g_model_registered) return cuda_model_ptr(model_map, offset);
+    if (bytes == 0) { cuda_range_exit_note(DS4_RANGE_EXIT_TRIVIAL, 0); return cuda_model_ptr(model_map, offset); }
+    if (g_model_device_owned || g_model_registered) { cuda_range_exit_note(DS4_RANGE_EXIT_WHOLE_MAP, bytes); return cuda_model_ptr(model_map, offset); }
     if (g_model_hmm_direct &&
         getenv("DS4_CUDA_WEIGHT_CACHE") == NULL &&
         getenv("DS4_CUDA_WEIGHT_PRELOAD") == NULL) {
+        cuda_range_exit_note(DS4_RANGE_EXIT_HMM, bytes);
         return cuda_model_ptr(model_map, offset);
     }
     const char *direct_env = getenv("DS4_CUDA_DIRECT_MODEL");
-    if (direct_env && direct_env[0]) return cuda_model_ptr(model_map, offset);
+    if (direct_env && direct_env[0]) {
+        cuda_range_exit_note(DS4_RANGE_EXIT_DIRECT_ENV, bytes);
+        return cuda_model_ptr(model_map, offset);
+    }
 
     const uint64_t end = offset + bytes;
     auto exact = g_model_range_by_offset.find(offset);
     if (exact != g_model_range_by_offset.end()) {
         const cuda_model_range &r = g_model_ranges[exact->second];
-        if (r.host_base == model_map && end >= offset && bytes <= r.bytes) return r.device_ptr;
+        if (r.host_base == model_map && end >= offset && bytes <= r.bytes) {
+            cuda_range_exit_note(r.host_registered ? DS4_RANGE_EXIT_REGISTERED
+                                                   : DS4_RANGE_EXIT_CACHED, bytes);
+            return r.device_ptr;
+        }
     }
     for (const cuda_model_range &r : g_model_ranges) {
         if (r.host_base == model_map && offset >= r.offset && end >= offset && end <= r.offset + r.bytes) {
+            cuda_range_exit_note(r.host_registered ? DS4_RANGE_EXIT_REGISTERED
+                                                   : DS4_RANGE_EXIT_CACHED, bytes);
             return r.device_ptr + (offset - r.offset);
         }
         if (r.host_base == model_map && r.host_registered && r.registered_base && r.registered_device_base) {
@@ -1076,13 +1238,16 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
             const uintptr_t h1 = h0 + bytes;
             const uintptr_t r0 = (uintptr_t)r.registered_base;
             const uintptr_t r1 = r0 + r.registered_bytes;
-            if (h1 >= h0 && h0 >= r0 && h1 <= r1) return r.registered_device_base + (h0 - r0);
+            if (h1 >= h0 && h0 >= r0 && h1 <= r1) {
+                cuda_range_exit_note(DS4_RANGE_EXIT_REGISTERED, bytes);
+                return r.registered_device_base + (h0 - r0);
+            }
         }
     }
 
     if (getenv("DS4_CUDA_NO_FD_CACHE") == NULL) {
         const char *fd_ptr = cuda_model_range_ptr_from_fd(model_map, offset, bytes, what);
-        if (fd_ptr) return fd_ptr;
+        if (fd_ptr) { cuda_range_exit_note(DS4_RANGE_EXIT_FD, bytes); return fd_ptr; }
     }
 
     cudaError_t err = cudaSuccess;
@@ -1108,6 +1273,7 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
                             what ? what : "weights",
                             (double)bytes / 1048576.0);
                 }
+                cuda_range_exit_note(DS4_RANGE_EXIT_MAPPED, bytes);
                 return dev_ptr;
             }
             fprintf(stderr, "ds4: CUDA model range map pointer failed for %s: %s\n",
@@ -1154,6 +1320,7 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
                 (double)bytes / 1048576.0,
                 (double)g_model_range_bytes / 1073741824.0);
     }
+    cuda_range_exit_note(DS4_RANGE_EXIT_COPIED, bytes);
     return (const char *)dev;
 }
 
@@ -1689,6 +1856,7 @@ static void cuda_q8_f16_cache_release_all(void) {
     g_q8_f16_by_offset.clear();
     g_q8_f16_bytes = 0;
 }
+
 
 static uint64_t cuda_parse_mib_env(const char *name, int *present) {
     const char *env = getenv(name);
@@ -2895,6 +3063,7 @@ static const char *cuda_model_range_ptr_from_fd(
         }
         cuda_model_drop_file_pages(offset + copied, n);
         cuda_model_discard_source_pages(model_map, g_model_registered_size, offset + copied, n);
+        g_model_range_h2d_bytes += n;
         copied += n;
         cuda_model_load_progress_note(g_model_range_bytes + copied);
         chunk_idx++;
@@ -23388,8 +23557,6 @@ static int cuda_q4_mma_tile16_shmem_ok(int which_down) {
 }
 
 
-
-
 __global__ static void moe_down_sorted_qwarp32_kernel(
         float *down_out,
         const char *down_base,
@@ -26592,6 +26759,8 @@ static int cuda_stream_expert_run_wave(cuda_expert_read_job *jobs, uint32_t n) {
             cuda_expert_reads_wait_one(i) :
             (cuda_expert_read_run(&jobs[i]) ? 1 : -1);
         if (status < 0) { ok = 0; break; }
+        if (jobs[i].decode)
+            g_expert_h2d_bytes += jobs[i].bytes;
         if (!cuda_ok(cudaMemcpyAsync(jobs[i].dst, jobs[i].payload,
                                      (size_t)jobs[i].bytes,
                                      cudaMemcpyHostToDevice,
@@ -26713,6 +26882,8 @@ static int cuda_stream_selected_cache_begin_load(
     uint64_t call_clock = 0;
     if (use_host) call_clock = ++g_host_experts.clock;
 
+    if (decode) cuda_probe_h2d_ceiling(table->gate_expert_bytes);
+
     /* Pass one: enqueue every hit, and note the misses without reading them. */
     std::vector<uint32_t> miss_compact;
     std::vector<int32_t>  miss_slot;
@@ -26738,6 +26909,8 @@ static int cuda_stream_selected_cache_begin_load(
                                (uint64_t)i * table->gate_expert_bytes;
                 char *v_down = g_stream_selected_cache.down_ptr +
                                (uint64_t)i * table->down_expert_bytes;
+                g_expert_h2d_bytes += 2u * table->gate_expert_bytes +
+                                      table->down_expert_bytes;
                 if (!cuda_ok(cudaMemcpyAsync(v_gate, h_base,
                                      (size_t)table->gate_expert_bytes,
                                      cudaMemcpyHostToDevice,
@@ -26883,10 +27056,22 @@ static int cuda_stream_selected_cache_begin_load(
         }
     }
 
-    if (!cuda_ok(cudaStreamSynchronize(g_stream_selected_upload_stream),
-                 "stream expert upload sync")) {
-        cuda_stream_selected_cache_invalidate();
-        return 0;
+    {
+        struct timespec w0, w1;
+        clock_gettime(CLOCK_MONOTONIC, &w0);
+        const int sync_ok = cuda_ok(
+                cudaStreamSynchronize(g_stream_selected_upload_stream),
+                "stream expert upload sync");
+        clock_gettime(CLOCK_MONOTONIC, &w1);
+        if (decode) {
+            g_expert_upload_wait_s +=
+                (double)(w1.tv_sec - w0.tv_sec) +
+                (double)(w1.tv_nsec - w0.tv_nsec) / 1e9;
+        }
+        if (!sync_ok) {
+            cuda_stream_selected_cache_invalidate();
+            return 0;
+        }
     }
     /* Publish the host-cache mappings only now that the slots hold good bytes:
      * a failed load can never leave a key pointing at stale ones. Every miss
@@ -28730,8 +28915,6 @@ extern "C" int ds4_gpu_glm_kv_lora_rms_norm_tensor(
     return cuda_ok(cudaGetLastError(), "glm kv lora rms norm launch");
 }
 
-
-
 __global__ static void glm_qk_lowrank_q8_0_batch_kernel(
         float *qk_low,
         const char *weight,
@@ -30404,10 +30587,6 @@ extern "C" int ds4_gpu_glm_store_compact_kv_tensor(
             cache_f16 ? 1u : 0u);
     return cuda_ok(cudaGetLastError(), "glm store compact kv launch");
 }
-
-
-
-
 
 
 
