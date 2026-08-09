@@ -127,6 +127,28 @@ static int g_cuda_moe_decode_graph;
 static int g_current_logical_tier = -1;
 static int g_ssd_streaming_mode;
 
+/* What the card had free before this engine committed a byte of it. Taken once,
+ * at the end of backend init: late enough that the CUDA context and the cuBLAS
+ * handles are already paid for, early enough that nothing of ours is. Every
+ * VRAM plan is drawn against this number rather than against a live reading
+ * taken mid-flight, which is a moving target and has misled us before. */
+static uint64_t g_vram_capacity_at_init;
+
+/* Bytes the q8->f16 weight pool currently holds. Defined here rather than
+ * beside the cache because the expert tier reports it too. */
+static uint64_t g_q8_f16_bytes;
+
+/* The streamed-path VRAM plan, installed once at engine open from sizes the
+ * engine already knows: the non-routed weights that stay resident for the whole
+ * run, the KV cache, the context buffers, and whatever the streaming loader
+ * reserves. What is left over is the room in which the optional VRAM consumers
+ * have to live — the routed-expert tier (a decode win) and the q8->f16 weight
+ * pool (a prefill win). See ds4_gpu_plan_streaming_vram. */
+static struct {
+    uint64_t spare;         /* capacity less every known commitment */
+    int      q8_f16_pool;   /* 1 if the pool is affordable */
+} g_vram_plan;
+
 typedef struct {
     int valid;
     int logical_tier;
@@ -553,12 +575,24 @@ static int cuda_vram_experts_alloc(uint64_t slot_bytes, uint32_t n_total) {
     g_vram_experts.cap = (uint32_t)cap;
     g_vram_experts.slot_bytes = slot_bytes;
     g_vram_experts.n_total = n_total;
-    fprintf(stderr,
-            "ds4: CUDA VRAM expert tier: %u experts, %.2f GiB "
-            "(%.0f%% of free VRAM at first decode token)\n",
-            g_vram_experts.cap,
-            (double)cap * slot_bytes / 1073741824.0,
-            cuda_vram_experts_take_fraction() * 100.0);
+    /* Report the plan next to what the card actually had: the gap between them
+     * is the graph's untracked transients, and it is what the plan's margin has
+     * to cover. Anyone re-deriving that margin on another card reads it here. */
+    {
+        size_t free_b = 0, total_b = 0;
+        (void)cudaMemGetInfo(&free_b, &total_b);
+        fprintf(stderr,
+                "ds4: CUDA VRAM expert tier: %u experts, %.2f GiB "
+                "(%.0f%% of the free VRAM at the first decode token, %.2f GiB "
+                "left; the plan plans on %.2f GiB spare, q8->f16 pool holds "
+                "%.2f)\n",
+                g_vram_experts.cap,
+                (double)cap * slot_bytes / 1073741824.0,
+                cuda_vram_experts_take_fraction() * 100.0,
+                (double)free_b / 1073741824.0,
+                (double)g_vram_plan.spare / 1073741824.0,
+                (double)g_q8_f16_bytes / 1073741824.0);
+    }
     return 1;
 }
 
@@ -1142,7 +1176,6 @@ static double g_derived_artifact_build_secs;
 static int g_derived_replaces_complete;
 static void *g_aligned_q81_scratch;
 static uint64_t g_model_range_bytes;
-static uint64_t g_q8_f16_bytes;
 static uint64_t g_q8_f32_bytes;
 static int g_q8_cache_suppressed;
 static int g_q8_f16_disabled_after_oom;
@@ -2270,8 +2303,98 @@ static void cuda_q8_f16_cache_disable_after_failure(const char *what, uint64_t r
     (void)cudaGetLastError();
 }
 
+static uint64_t cuda_stream_stage_budget_bytes(void);
+
+/* Install the streamed-path VRAM plan. Called once per engine open, from the
+ * same place that prints the memory plan, with the sizes the engine has just
+ * finished computing. Every term is known before a byte is committed, which is
+ * the whole point: the same decision taken from a live free-VRAM reading during
+ * the first prefill came out worse than no decision at all, because at that
+ * moment most of the run's commitments are still in the future.
+ *
+ * What the plan cannot see is the graph's own transients — cuBLAS workspaces,
+ * the prefill activation arena, the per-layer expert buffers the MoE path
+ * allocates as it runs. Measured on a 12 GiB card those come to about 1.3 GiB,
+ * so `spare` is optimistic by roughly that much and a decision taken at
+ * spare > 0 would be wrong. Hence the margin below. */
+extern "C" void ds4_gpu_plan_streaming_vram(uint64_t model_bytes,
+                                            uint64_t kv_bytes,
+                                            uint64_t buffer_bytes,
+                                            uint64_t stream_bytes,
+                                            uint64_t routed_working_set_bytes) {
+    memset(&g_vram_plan, 0, sizeof(g_vram_plan));
+    if (g_vram_capacity_at_init == 0) return;
+
+    /* The loader's staging arena is a reservation only the accelerator knows
+     * about, so it joins the engine's own streaming terms here. */
+    const uint64_t stream_total =
+        stream_bytes + cuda_stream_stage_budget_bytes();
+    const uint64_t parts[4] = { model_bytes, kv_bytes, buffer_bytes, stream_total };
+    uint64_t committed = 0;
+    for (int i = 0; i < 4; i++) {
+        committed = committed > UINT64_MAX - parts[i] ? UINT64_MAX
+                                                      : committed + parts[i];
+    }
+    g_vram_plan.spare = g_vram_capacity_at_init > committed ?
+        g_vram_capacity_at_init - committed : 0;
+
+    /* One token's routed experts is the margin. It is not a guess at the size of
+     * the unmodelled transients but a quantity of the same nature: those
+     * transients are staging arenas, layer expert buffers and upload waves, all
+     * of them sized in experts, so a model with fatter experts leaves a bigger
+     * shadow and the margin grows with it. It scales with the model rather than
+     * with this card, which is what makes it portable to an 8 or 24 GiB one.
+     *
+     * Measured against it on a 12 GiB card: ctx 4096 plans 1.97 GiB spare, the
+     * pool builds to 1.00 GiB and decode is 3.92 -> 3.85 t/s, i.e. free; ctx
+     * 131072 plans 0.00, and forcing the pool there builds only 0.38 GiB and
+     * still costs 3.80 -> 3.38 t/s. The pool is free where the plan shows slack
+     * and expensive where it shows none; at the two contexts measured there was
+     * no middle ground. */
+    g_vram_plan.q8_f16_pool =
+        routed_working_set_bytes != 0 &&
+        g_vram_plan.spare >= routed_working_set_bytes;
+
+    /* Diagnostic override, so the two arms of that measurement stay reachable. */
+    const char *env = getenv("DS4_CUDA_Q8_F16_PLAN");
+    if (env && env[0]) {
+        if (!strcmp(env, "on"))  g_vram_plan.q8_f16_pool = 1;
+        if (!strcmp(env, "off")) g_vram_plan.q8_f16_pool = 0;
+    }
+
+    fprintf(stderr,
+            "ds4: CUDA VRAM plan: card %.2f GiB - model %.2f - KV %.2f - buffers %.2f"
+            " - streaming %.2f = %.2f GiB spare against a %.2f GiB margin;"
+            " q8->f16 weight pool %s\n",
+            (double)g_vram_capacity_at_init / 1073741824.0,
+            (double)model_bytes / 1073741824.0,
+            (double)kv_bytes / 1073741824.0,
+            (double)buffer_bytes / 1073741824.0,
+            (double)stream_total / 1073741824.0,
+            (double)g_vram_plan.spare / 1073741824.0,
+            (double)routed_working_set_bytes / 1073741824.0,
+            g_vram_plan.q8_f16_pool ? "built" : "declined");
+}
+
 static int cuda_q8_f16_cache_allowed(const char *label, uint64_t in_dim, uint64_t out_dim) {
     if (g_quality_mode) return 0;
+    /* Under SSD streaming, only where the plan says the card can carry it.
+     *
+     * This cache trades VRAM for faster prefill GEMMs, and decode provably never
+     * reads it: both consumers are gated on token count (`n_tok > 1` in the dense
+     * matmul, `n_tokens >= out_a_cublas_min_tokens` in the attention output).
+     * Streaming is entered precisely because the model does not fit, so VRAM is
+     * the scarce resource and the routed-expert tiers are what want it.
+     *
+     * Measured on a 12 GiB card at ctx 131072: building it takes 1.23 GiB and
+     * decode runs 3.38/3.41 t/s against 4.06/4.19 with it never built — 21% for a
+     * cache nothing in decode consults. Freeing it once decode starts does not
+     * recover that, the commitment has already been made. It also denies the VRAM
+     * expert tier the room to exist at all, which is most of the loss. But that
+     * is a statement about a card with no room, not about streaming: where the
+     * plan shows headroom the pool costs nothing and prefill keeps its faster
+     * kernels, so the choice belongs to the plan and not to the mode. */
+    if (g_ssd_streaming_mode && !g_vram_plan.q8_f16_pool) return 0;
     if (g_q8_cache_suppressed) return 0;
     if (g_q8_f16_disabled_after_oom) return 0;
     if (getenv("DS4_CUDA_NO_Q8_F16_CACHE") != NULL) return 0;
@@ -3627,6 +3750,12 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
         }
     }
 
+    {
+        size_t free_b = 0, total_b = 0;
+        if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
+            g_vram_capacity_at_init = (uint64_t)free_b;
+        }
+    }
     g_cublas_ready = 1;
     return 1;
 }

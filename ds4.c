@@ -36967,7 +36967,11 @@ static uint64_t ds4_engine_streaming_transient_guard_bytes(
     return total;
 }
 
-static void ds4_engine_print_startup_memory(
+/* Size every commitment the run will make, report it, and hand it to the
+ * accelerator. The report is what a user reads to decide whether a context size
+ * fits; the same numbers are what the accelerator sizes its optional caches
+ * from, so the two can never drift apart. */
+static void ds4_engine_plan_startup_memory(
         const ds4_engine *e,
         int               ctx_size) {
     if (!e || ctx_size <= 0) return;
@@ -37008,9 +37012,23 @@ static void ds4_engine_print_startup_memory(
         ds4_engine_dynamic_expert_cache_bytes(e);
     const uint64_t expert_reserved_bytes =
         e->ssd_streaming_prefill_headroom_bytes;
+    /* Under streaming the initial map is the token embedding alone; the rest of
+     * the non-routed weights become resident on first touch during prefill and
+     * are never released. Plan for what will be resident, not for what has been
+     * mapped so far — on a 12 GiB card that is 7.22 GiB against the 0.99 GiB the
+     * span count reports, and anything budgeted from the smaller number is drawn
+     * against VRAM that is already spoken for. */
+    uint64_t resident_model_bytes = e->startup_model_span_bytes;
+    if (e->ssd_streaming) {
+        uint64_t non_routed_bytes = 0;
+        if (weights_streaming_non_routed_bytes(&e->weights, &non_routed_bytes) &&
+            non_routed_bytes > resident_model_bytes) {
+            resident_model_bytes = non_routed_bytes;
+        }
+    }
     uint64_t total = kv_bytes;
     total = ds4_add_sat_u64(total, mem.scratch_bytes);
-    total = ds4_add_sat_u64(total, e->startup_model_span_bytes);
+    total = ds4_add_sat_u64(total, resident_model_bytes);
     total = ds4_add_sat_u64(total, dynamic_expert_cache_bytes);
     total = ds4_add_sat_u64(total, e->ssd_streaming_full_layer_bytes);
     total = ds4_add_sat_u64(total, expert_reserved_bytes);
@@ -37028,7 +37046,7 @@ static void ds4_engine_print_startup_memory(
             ds4_bytes_to_gib(mem.raw_bytes),
             ds4_bytes_to_gib(mem.compressed_bytes),
             ds4_bytes_to_gib(mem.scratch_bytes),
-            ds4_bytes_to_gib(e->startup_model_span_bytes));
+            ds4_bytes_to_gib(resident_model_bytes));
     if (e->ssd_streaming_full_layer_bytes != 0) {
         fprintf(stderr,
                 " + full-layer experts %.2f GiB",
@@ -37060,6 +37078,24 @@ static void ds4_engine_print_startup_memory(
             mem.comp_cap,
             ds4_backend_name(e->backend),
             reset);
+
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    /* Hand the same plan to the accelerator, which has its own optional VRAM
+     * consumers to size and until now sized them against whatever happened to be
+     * free at the moment each one asked. The dynamic expert cache is deliberately
+     * absent: on CUDA it is a pinned host allocation, not a device one. */
+    if (e->ssd_streaming && e->backend == DS4_BACKEND_CUDA) {
+        uint64_t per_expert_bytes = 0;
+        (void)ds4_streaming_routed_expert_bytes(&e->weights, &per_expert_bytes);
+        ds4_gpu_plan_streaming_vram(
+                resident_model_bytes,
+                kv_bytes,
+                mem.scratch_bytes,
+                ds4_add_sat_u64(e->ssd_streaming_full_layer_bytes,
+                                expert_reserved_bytes),
+                per_expert_bytes * DS4_N_LAYER * DS4_N_EXPERT_USED);
+    }
+#endif
 }
 
 static bool cpu_directional_steering_enabled(
@@ -58341,7 +58377,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
 #endif
 
     if (!opt->inspect_only) {
-        ds4_engine_print_startup_memory(e, opt->context_size);
+        ds4_engine_plan_startup_memory(e, opt->context_size);
     }
     *out = e;
     return 0;

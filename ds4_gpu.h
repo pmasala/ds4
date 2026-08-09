@@ -123,6 +123,17 @@ int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
 int ds4_gpu_q8_cache_suppressed(void);
 void ds4_gpu_set_q8_cache_suppressed(int suppressed);
+/* Hand the accelerator the engine's VRAM plan for a streamed run, once, at
+ * engine open: the weights that stay resident, the KV cache, the context
+ * buffers, whatever the streaming loader reserves, and one token's worth of
+ * routed experts. The accelerator decides from it which of its optional VRAM
+ * consumers it can afford. Sizes are all known before anything is committed —
+ * that is the point, a plan drawn mid-flight is worse than no plan. */
+void ds4_gpu_plan_streaming_vram(uint64_t model_bytes,
+                                 uint64_t kv_bytes,
+                                 uint64_t buffer_bytes,
+                                 uint64_t stream_bytes,
+                                 uint64_t routed_working_set_bytes);
 #ifdef DS4_ROCM_BUILD
 void ds4_gpu_release_q8_f16_cache(void);
 #endif
