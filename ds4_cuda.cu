@@ -214,10 +214,15 @@ typedef struct {
     int      disabled;        /* sticky: opt-out or pinning failed, stop trying */
     uint32_t budget_experts;  /* planner slot budget; 0 = not pushed */
     uint64_t slab_bytes;      /* per-expert slab size class; 0 = not pushed */
-    /* Arena; freed only at teardown or geometry change, flushed on map change. */
+    /* Arena; freed only at teardown or geometry change, flushed on map change.
+     * One pinned allocation PER SLOT, not one arena: reader threads memcpy
+     * misses into their slots while hit copies DMA-read other slots, and under
+     * WSL2's paravirtual GPU that pairing corrupts occasionally when the two
+     * targets share a pinned allocation — same hazard, same fix as the staging
+     * slots in cuda_stream_stage_ensure. */
     uint32_t cap;             /* allocated slots; 0 = not allocated */
-    uint64_t slot_bytes;      /* slab stride: gate at 0, up at +gate, down at +2*gate */
-    char    *slab;            /* one pinned arena, cap * slot_bytes */
+    uint64_t slot_bytes;      /* slot layout: gate at 0, up at +gate, down at +2*gate */
+    char   **slot_ptr;        /* [cap] one pinned allocation each */
     /* Content bookkeeping; reset by flush. */
     uint32_t n_total;         /* experts per layer; row stride of the maps */
     uint32_t used;
@@ -680,8 +685,14 @@ static void cuda_host_experts_flush(void) {
 
 static void cuda_host_experts_free(void) {
     cuda_host_experts_flush();
-    if (g_host_experts.slab) (void)cudaFreeHost(g_host_experts.slab);
-    g_host_experts.slab = NULL;
+    if (g_host_experts.slot_ptr) {
+        for (uint32_t i = 0; i < g_host_experts.cap; i++) {
+            if (g_host_experts.slot_ptr[i])
+                (void)cudaFreeHost(g_host_experts.slot_ptr[i]);
+        }
+        free(g_host_experts.slot_ptr);
+        g_host_experts.slot_ptr = NULL;
+    }
     g_host_experts.cap = 0;
     g_host_experts.slot_bytes = 0;
     g_host_experts.slot_key.clear();
@@ -761,21 +772,39 @@ static int cuda_host_experts_alloc(uint64_t slot_bytes, uint64_t cap_request) {
         return 0;
     }
 
-    for (;;) {
-        cudaError_t err = cudaMallocHost((void **)&g_host_experts.slab,
-                                         (size_t)cap * slot_bytes);
-        if (err == cudaSuccess) break;
-        g_host_experts.slab = NULL;
-        (void)cudaGetLastError();
-        if (cap < 64u) {
-            g_host_experts.disabled = 1;
-            fprintf(stderr,
-                    "ds4: CUDA host expert cache unavailable (pinned alloc "
-                    "failed); using SSD reads\n");
-            return 0;
-        }
-        cap /= 2u;
+    /* One pinned allocation per slot (see the struct comment for why). The
+     * old halving backoff becomes take-what-pins: on the first failed slot the
+     * cache keeps what it has, which lands nearer the true ceiling than any
+     * fixed step could. */
+    g_host_experts.slot_ptr = (char **)calloc((size_t)cap, sizeof(char *));
+    if (!g_host_experts.slot_ptr) {
+        g_host_experts.disabled = 1;
+        return 0;
     }
+    uint64_t pinned = 0;
+    for (; pinned < cap; pinned++) {
+        void *p = NULL;
+        if (cudaMallocHost(&p, (size_t)slot_bytes) != cudaSuccess) {
+            (void)cudaGetLastError();
+            break;
+        }
+        g_host_experts.slot_ptr[pinned] = (char *)p;
+    }
+    if (pinned < 64u) {
+        for (uint64_t i = 0; i < pinned; i++)
+            (void)cudaFreeHost(g_host_experts.slot_ptr[i]);
+        free(g_host_experts.slot_ptr);
+        g_host_experts.slot_ptr = NULL;
+        g_host_experts.disabled = 1;
+        fprintf(stderr,
+                "ds4: CUDA host expert cache unavailable (pinned %llu of %llu "
+                "slots); using SSD reads\n",
+                (unsigned long long)pinned, (unsigned long long)cap);
+        return 0;
+    }
+    cap = pinned;
+    /* cap is published before the maps so the failure path frees the slots. */
+    g_host_experts.cap = (uint32_t)cap;
     try {
         g_host_experts.slot_key.assign(cap, -1);
         g_host_experts.slot_used.assign(cap, 0ull);
@@ -784,7 +813,6 @@ static int cuda_host_experts_alloc(uint64_t slot_bytes, uint64_t cap_request) {
         g_host_experts.disabled = 1;
         return 0;
     }
-    g_host_experts.cap = (uint32_t)cap;
     g_host_experts.slot_bytes = slot_bytes;
     g_host_experts.last_layer = UINT32_MAX;
     fprintf(stderr,
@@ -27357,8 +27385,7 @@ static int cuda_stream_selected_cache_begin_load(
             const size_t key = (size_t)table->layer * n_total + expert;
             const int32_t hit = g_host_experts.slot_of[key];
             if (hit >= 0) {
-                const char *h_base = g_host_experts.slab +
-                                     (uint64_t)hit * g_host_experts.slot_bytes;
+                const char *h_base = g_host_experts.slot_ptr[hit];
                 char *v_gate = g_stream_selected_cache.gate_ptr +
                                (uint64_t)i * table->gate_expert_bytes;
                 char *v_up   = g_stream_selected_cache.up_ptr +
@@ -27432,8 +27459,7 @@ static int cuda_stream_selected_cache_begin_load(
             const uint32_t i = miss_compact[m];
             const uint32_t expert = (uint32_t)compact_ids[i];
             char *mirror = miss_slot[m] >= 0 ?
-                g_host_experts.slab +
-                    (uint64_t)miss_slot[m] * g_host_experts.slot_bytes : NULL;
+                g_host_experts.slot_ptr[miss_slot[m]] : NULL;
             /* [gate | up | down] — the order is the host-cache slot's layout. */
             const uint64_t src[3] = {
                 table->gate_offset + (uint64_t)expert * table->gate_expert_bytes,
