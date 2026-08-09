@@ -288,6 +288,45 @@ static void cuda_probe_h2d_ceiling(uint64_t expert_bytes) {
     (void)cudaFreeHost(host);
 }
 
+/* VRAM routed-expert tier (L1), above the pinned host cache (L2) and the GGUF
+ * on SSD (L3).
+ *
+ * The two tiers answer different questions and must not be confused. L2 decides
+ * where an expert's bytes are FETCHED FROM, and its metric is SSD reads per
+ * token. It cannot change the fact that every selected expert is then copied
+ * into the layer's VRAM buffer: measured, 43 x 6 x 6.75 MiB = 1741.50 MiB cross
+ * PCIe every token at any hit rate. L1 is the only tier that changes THAT — a
+ * resident expert is copied device-to-device at VRAM bandwidth instead of
+ * travelling the bus, so its metric is PCIe bytes per token.
+ *
+ * Sizing is deliberately not a constant. The slab is allocated lazily at the
+ * first decode token, which is after prefill has taken its transient peak and
+ * after the q8->f16 weight cache has finished growing (that cache has no
+ * eviction and never re-asks), so what is free then is genuinely spare. A
+ * fraction of it is left untouched for the driver and for decode's own
+ * transients. On a big card this yields a large tier, on a small one it yields
+ * nothing and the path degrades to exactly today's behaviour.
+ *
+ * Eviction mirrors L2's route-hotness policy so the two stay comparable, but
+ * note the economics differ by ~7x: an L1 miss costs a PCIe copy, an L2 miss
+ * costs an SSD read. L1 can afford to be wrong more often. */
+typedef struct {
+    int      disabled;        /* sticky: opt-out, or allocation failed */
+    uint32_t cap;
+    uint64_t slot_bytes;      /* gate at 0, up at +gate, down at +2*gate */
+    char    *slab;            /* one device allocation, cap * slot_bytes */
+    uint32_t n_total;         /* experts per layer; row stride of the maps */
+    uint32_t used;
+    uint64_t clock;
+    uint64_t hits;
+    uint64_t misses;
+    std::vector<int32_t>  slot_of;
+    std::vector<uint32_t> hotness;
+    std::vector<int32_t>  slot_key;
+    std::vector<uint64_t> slot_used;
+} cuda_vram_expert_cache;
+
+static cuda_vram_expert_cache g_vram_experts;
 
 /* Which exit of cuda_model_range_ptr serves each weight lookup, and how many
  * bytes it hands out. Some exits return a DEVICE address (free to read) and some
@@ -340,6 +379,16 @@ static void cuda_expert_load_report(void) {
                  (unsigned long long)seen,
                  100.0 * (double)g_host_experts.hits / (double)seen,
                  g_host_experts.used, g_host_experts.cap);
+    }
+    const uint64_t vseen = g_vram_experts.hits + g_vram_experts.misses;
+    if (vseen != 0) {
+        fprintf(stderr,
+                "ds4: CUDA VRAM expert tier: %llu hits / %llu lookups "
+                "(%.1f%% hit, %u/%u slots) — bus traffic avoided\n",
+                (unsigned long long)g_vram_experts.hits,
+                (unsigned long long)vseen,
+                100.0 * (double)g_vram_experts.hits / (double)vseen,
+                g_vram_experts.used, g_vram_experts.cap);
     }
     const uint64_t h2d = g_expert_h2d_bytes;
     if (g_model_range_h2d_bytes != 0) {
@@ -400,6 +449,175 @@ static void cuda_expert_load_report(void) {
             (double)h2d / 1073741824.0);
 }
 
+
+static void cuda_vram_experts_free(void) {
+    if (g_vram_experts.slab) (void)cudaFree(g_vram_experts.slab);
+    g_vram_experts.slab = NULL;
+    g_vram_experts.cap = 0;
+    g_vram_experts.used = 0;
+    g_vram_experts.n_total = 0;
+    g_vram_experts.slot_bytes = 0;
+    g_vram_experts.clock = 0;
+    g_vram_experts.hits = 0;
+    g_vram_experts.misses = 0;
+    g_vram_experts.slot_of.clear();
+    g_vram_experts.hotness.clear();
+    g_vram_experts.slot_key.clear();
+    g_vram_experts.slot_used.clear();
+}
+
+/* Fraction of the VRAM that is free at first decode which the tier may take.
+ * The remainder covers cuBLAS workspaces, the scratch arena, and driver
+ * bookkeeping, none of which are in this accounting. */
+static double cuda_vram_experts_take_fraction(void) {
+    const char *env = getenv("DS4_CUDA_VRAM_EXPERT_CACHE_PCT");
+    if (env && env[0]) {
+        char *end = NULL;
+        const double v = strtod(env, &end);
+        if (end != env && v >= 0.0 && v <= 95.0) return v / 100.0;
+        fprintf(stderr,
+                "ds4: ignoring invalid DS4_CUDA_VRAM_EXPERT_CACHE_PCT=\"%s\"\n",
+                env);
+    }
+    return 0.60;
+}
+
+static int cuda_vram_experts_alloc(uint64_t slot_bytes, uint32_t n_total) {
+    if (g_vram_experts.disabled || slot_bytes == 0 || n_total == 0) return 0;
+    if (g_vram_experts.cap != 0) return 1;
+
+    const char *env = getenv("DS4_CUDA_VRAM_EXPERT_CACHE_GB");
+    uint64_t budget = 0;
+    if (env && env[0] && !strcmp(env, "0")) {
+        g_vram_experts.disabled = 1;      /* documented opt-out */
+        return 0;
+    }
+    if (env && env[0] && ds4_parse_gib_arg(env, &budget)) {
+        /* explicit override */
+    } else {
+        size_t free_b = 0, total_b = 0;
+        if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+            g_vram_experts.disabled = 1;
+            return 0;
+        }
+        budget = (uint64_t)((double)free_b * cuda_vram_experts_take_fraction());
+    }
+
+    uint64_t cap = budget / slot_bytes;
+    if (cap > UINT32_MAX) cap = UINT32_MAX;
+    if (cap == 0) {
+        g_vram_experts.disabled = 1;
+        fprintf(stderr,
+                "ds4: CUDA VRAM expert tier disabled (no spare VRAM); "
+                "experts keep crossing PCIe every token\n");
+        return 0;
+    }
+
+    /* Back off gently, not by halving. cudaMemGetInfo over-reports what is
+     * actually allocatable (markedly so under WSL2, where the pool is
+     * virtualised), so the first request usually fails and the question is how
+     * much of the real ceiling the retry finds. Halving overshoots downward by
+     * up to 2x per step and compounded to an 8x loss here: 4.59 GiB requested,
+     * 0.57 GiB taken, with the true ceiling somewhere between. A 3/4 step lands
+     * within 25% of it for a handful of extra failed calls, which cost nothing
+     * — they happen once, at the first decode load. */
+    const uint64_t cap_request = cap;
+    void *slab = NULL;
+    while (cap != 0 && cudaMalloc(&slab, (size_t)cap * slot_bytes) != cudaSuccess) {
+        (void)cudaGetLastError();
+        slab = NULL;
+        const uint64_t next = cap * 3u / 4u;
+        cap = next < cap ? next : cap - 1u;
+    }
+    if (slab && cap < cap_request) {
+        fprintf(stderr,
+                "ds4: CUDA VRAM expert tier: asked %llu slots, took %llu "
+                "(driver reported more free VRAM than it would allocate)\n",
+                (unsigned long long)cap_request, (unsigned long long)cap);
+    }
+    if (!slab) {
+        g_vram_experts.disabled = 1;
+        fprintf(stderr,
+                "ds4: CUDA VRAM expert tier unavailable (alloc failed)\n");
+        return 0;
+    }
+    try {
+        g_vram_experts.slot_key.assign(cap, -1);
+        g_vram_experts.slot_used.assign(cap, 0ull);
+    } catch (...) {
+        (void)cudaFree(slab);
+        g_vram_experts.disabled = 1;
+        return 0;
+    }
+    g_vram_experts.slab = (char *)slab;
+    g_vram_experts.cap = (uint32_t)cap;
+    g_vram_experts.slot_bytes = slot_bytes;
+    g_vram_experts.n_total = n_total;
+    fprintf(stderr,
+            "ds4: CUDA VRAM expert tier: %u experts, %.2f GiB "
+            "(%.0f%% of free VRAM at first decode token)\n",
+            g_vram_experts.cap,
+            (double)cap * slot_bytes / 1073741824.0,
+            cuda_vram_experts_take_fraction() * 100.0);
+    return 1;
+}
+
+/* Same victim rule as the host tier: lowest route hotness, LRU tiebreak,
+ * skipping anything this call already installed. */
+static int32_t cuda_vram_experts_take_slot(uint64_t call_clock) {
+    if (g_vram_experts.used < g_vram_experts.cap)
+        return (int32_t)g_vram_experts.used++;
+    int32_t victim = -1;
+    uint32_t best_hot = UINT32_MAX;
+    uint64_t best_used = UINT64_MAX;
+    for (uint32_t s = 0; s < g_vram_experts.cap; s++) {
+        if (g_vram_experts.slot_used[s] == call_clock) continue;
+        const int32_t key = g_vram_experts.slot_key[s];
+        const uint32_t hot = key < 0 ? 0u : g_vram_experts.hotness[(size_t)key];
+        if (hot < best_hot ||
+            (hot == best_hot && g_vram_experts.slot_used[s] < best_used)) {
+            best_hot = hot;
+            best_used = g_vram_experts.slot_used[s];
+            victim = (int32_t)s;
+        }
+    }
+    if (victim >= 0) {
+        const int32_t old = g_vram_experts.slot_key[victim];
+        if (old >= 0) g_vram_experts.slot_of[(size_t)old] = -1;
+        g_vram_experts.slot_key[victim] = -1;
+    }
+    return victim;
+}
+
+static int cuda_vram_experts_ensure_maps(uint32_t layer) {
+    const size_t need = (size_t)(layer + 1u) * g_vram_experts.n_total;
+    if (g_vram_experts.slot_of.size() >= need) return 1;
+    try {
+        g_vram_experts.slot_of.resize(need, -1);
+        g_vram_experts.hotness.resize(need, 0u);
+    } catch (...) {
+        return 0;
+    }
+    return 1;
+}
+
+/* Called on the decode path only, so the first call is necessarily after
+ * prefill: that is what makes "free VRAM now" a safe budget to size from. */
+static int cuda_vram_experts_ensure(uint32_t n_total,
+                                    uint64_t gate_bytes,
+                                    uint64_t down_bytes) {
+    if (g_vram_experts.disabled || g_host_experts.glm_model) return 0;
+    if (n_total == 0 || gate_bytes == 0 || down_bytes == 0) return 0;
+    const uint64_t slot_bytes = 2u * gate_bytes + down_bytes;
+    if (g_vram_experts.cap != 0) {
+        if (g_vram_experts.slot_bytes == slot_bytes &&
+            g_vram_experts.n_total == n_total) {
+            return 1;
+        }
+        cuda_vram_experts_free();       /* geometry changed under us */
+    }
+    return cuda_vram_experts_alloc(slot_bytes, n_total);
+}
 
 /* Drop the cached CONTENT but keep the pinned arena. Called when the model
  * mapping changes: the bytes may be stale, but the arena geometry is engine
@@ -604,6 +822,10 @@ static void cuda_host_experts_note_token(uint32_t layer) {
             DS4_CUDA_HOST_EXPERT_HOTNESS_DECAY_TOKENS == 0u) {
             for (size_t i = 0; i < g_host_experts.hotness.size(); i++)
                 g_host_experts.hotness[i] >>= 1;
+            /* Same decay for the VRAM tier so the two policies stay
+             * comparable when their hit rates are read side by side. */
+            for (size_t i = 0; i < g_vram_experts.hotness.size(); i++)
+                g_vram_experts.hotness[i] >>= 1;
         }
         static int verbose = -1;
         if (verbose < 0)
@@ -728,6 +950,8 @@ static int cuda_q4_mma_ok(void) {
     }
     return cached;
 }
+
+
 
 
 
@@ -23557,6 +23781,8 @@ static int cuda_q4_mma_tile16_shmem_ok(int which_down) {
 }
 
 
+
+
 __global__ static void moe_down_sorted_qwarp32_kernel(
         float *down_out,
         const char *down_base,
@@ -26882,14 +27108,25 @@ static int cuda_stream_selected_cache_begin_load(
     uint64_t call_clock = 0;
     if (use_host) call_clock = ++g_host_experts.clock;
 
+    /* The VRAM tier is checked before the host one: a resident expert is copied
+     * device-to-device and never touches the bus, which is the only way the
+     * per-token PCIe total moves at all. */
     if (decode) cuda_probe_h2d_ceiling(table->gate_expert_bytes);
+    const int use_vram =
+        decode && cuda_vram_experts_ensure(n_total, table->gate_expert_bytes,
+                                           table->down_expert_bytes) &&
+        cuda_vram_experts_ensure_maps(table->layer);
+    uint64_t vram_clock = 0;
+    if (use_vram) vram_clock = ++g_vram_experts.clock;
 
     /* Pass one: enqueue every hit, and note the misses without reading them. */
     std::vector<uint32_t> miss_compact;
     std::vector<int32_t>  miss_slot;
+    std::vector<uint32_t> vram_fill;    /* compact ids to install into L1 */
     try {
         miss_compact.reserve(compact_ids.size());
         miss_slot.reserve(compact_ids.size());
+        vram_fill.reserve(compact_ids.size());
     } catch (...) {
         cuda_stream_selected_cache_invalidate();
         return 0;
@@ -26897,6 +27134,46 @@ static int cuda_stream_selected_cache_begin_load(
     for (uint32_t i = 0; i < compact_ids.size(); i++) {
         const uint32_t expert = (uint32_t)compact_ids[i];
         int32_t slot = -1;
+        if (use_vram) {
+            const size_t key = (size_t)table->layer * n_total + expert;
+            const int32_t hit = g_vram_experts.slot_of[key];
+            if (hit >= 0) {
+                const char *d_base = g_vram_experts.slab +
+                                     (uint64_t)hit * g_vram_experts.slot_bytes;
+                char *v_gate = g_stream_selected_cache.gate_ptr +
+                               (uint64_t)i * table->gate_expert_bytes;
+                char *v_up   = g_stream_selected_cache.up_ptr +
+                               (uint64_t)i * table->gate_expert_bytes;
+                char *v_down = g_stream_selected_cache.down_ptr +
+                               (uint64_t)i * table->down_expert_bytes;
+                if (!cuda_ok(cudaMemcpyAsync(v_gate, d_base,
+                                     (size_t)table->gate_expert_bytes,
+                                     cudaMemcpyDeviceToDevice,
+                                     g_stream_selected_upload_stream),
+                             "vram->vram gate expert") ||
+                    !cuda_ok(cudaMemcpyAsync(v_up,
+                                     d_base + table->gate_expert_bytes,
+                                     (size_t)table->gate_expert_bytes,
+                                     cudaMemcpyDeviceToDevice,
+                                     g_stream_selected_upload_stream),
+                             "vram->vram up expert") ||
+                    !cuda_ok(cudaMemcpyAsync(v_down,
+                                     d_base + 2u * table->gate_expert_bytes,
+                                     (size_t)table->down_expert_bytes,
+                                     cudaMemcpyDeviceToDevice,
+                                     g_stream_selected_upload_stream),
+                             "vram->vram down expert")) {
+                    (void)cudaStreamSynchronize(g_stream_selected_upload_stream);
+                    cuda_stream_selected_cache_invalidate();
+                    return 0;
+                }
+                g_vram_experts.hits++;
+                g_vram_experts.slot_used[hit] = vram_clock;
+                continue;
+            }
+            g_vram_experts.misses++;
+            vram_fill.push_back(i);   /* reserved above, cannot throw */
+        }
         if (use_host) {
             const size_t key = (size_t)table->layer * n_total + expert;
             const int32_t hit = g_host_experts.slot_of[key];
@@ -27086,6 +27363,64 @@ static int cuda_stream_selected_cache_begin_load(
                                (uint32_t)compact_ids[miss_compact[m]];
             g_host_experts.slot_key[miss_slot[m]] = (int32_t)key;
             g_host_experts.slot_of[key] = miss_slot[m];
+        }
+    }
+    /* Install into the VRAM tier from the bytes that just landed in the layer
+     * buffer: device-to-device, so it costs VRAM bandwidth and no bus traffic.
+     * A slot that cannot be taken (tier smaller than this call's expert set)
+     * simply leaves the expert uncached for next time. */
+    for (size_t f = 0; f < vram_fill.size(); f++) {
+        const uint32_t i = vram_fill[f];
+        const int32_t slot = cuda_vram_experts_take_slot(vram_clock);
+        if (slot < 0) continue;
+        char *d_base = g_vram_experts.slab +
+                       (uint64_t)slot * g_vram_experts.slot_bytes;
+        const char *v_gate = g_stream_selected_cache.gate_ptr +
+                             (uint64_t)i * table->gate_expert_bytes;
+        const char *v_up   = g_stream_selected_cache.up_ptr +
+                             (uint64_t)i * table->gate_expert_bytes;
+        const char *v_down = g_stream_selected_cache.down_ptr +
+                             (uint64_t)i * table->down_expert_bytes;
+        if (!cuda_ok(cudaMemcpyAsync(d_base, v_gate,
+                             (size_t)table->gate_expert_bytes,
+                             cudaMemcpyDeviceToDevice,
+                             g_stream_selected_upload_stream),
+                     "install gate expert in vram tier") ||
+            !cuda_ok(cudaMemcpyAsync(d_base + table->gate_expert_bytes, v_up,
+                             (size_t)table->gate_expert_bytes,
+                             cudaMemcpyDeviceToDevice,
+                             g_stream_selected_upload_stream),
+                     "install up expert in vram tier") ||
+            !cuda_ok(cudaMemcpyAsync(d_base + 2u * table->gate_expert_bytes,
+                             v_down, (size_t)table->down_expert_bytes,
+                             cudaMemcpyDeviceToDevice,
+                             g_stream_selected_upload_stream),
+                     "install down expert in vram tier")) {
+            (void)cudaStreamSynchronize(g_stream_selected_upload_stream);
+            cuda_stream_selected_cache_invalidate();
+            return 0;
+        }
+        const size_t key = (size_t)table->layer * n_total +
+                           (uint32_t)compact_ids[i];
+        g_vram_experts.slot_key[slot] = (int32_t)key;
+        g_vram_experts.slot_of[key] = slot;
+        g_vram_experts.slot_used[slot] = vram_clock;
+    }
+    /* The installs above are the last thing enqueued on the upload stream, and
+     * the MoE kernels read the layer buffer they copy FROM, so they must have
+     * completed before the caller enqueues that work. */
+    if (!vram_fill.empty() &&
+        !cuda_ok(cudaStreamSynchronize(g_stream_selected_upload_stream),
+                 "vram tier install sync")) {
+        cuda_stream_selected_cache_invalidate();
+        return 0;
+    }
+    if (use_vram) {
+        for (uint32_t i = 0; i < slot_count; i++) {
+            const size_t idx = (size_t)table->layer * n_total +
+                               (uint32_t)selected_ids[i];
+            uint32_t *h = &g_vram_experts.hotness[idx];
+            if (*h != UINT32_MAX) (*h)++;
         }
     }
     /* A token boundary is also the denominator of the read-work report, so it
@@ -28915,6 +29250,8 @@ extern "C" int ds4_gpu_glm_kv_lora_rms_norm_tensor(
     return cuda_ok(cudaGetLastError(), "glm kv lora rms norm launch");
 }
 
+
+
 __global__ static void glm_qk_lowrank_q8_0_batch_kernel(
         float *qk_low,
         const char *weight,
@@ -30590,6 +30927,10 @@ extern "C" int ds4_gpu_glm_store_compact_kv_tensor(
 
 
 
+
+
+
+
 __global__ static void glm_store_indexer_k_kernel(
         char *cache,
         const float *raw_k,
@@ -31420,6 +31761,7 @@ extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {
     if (!g_ssd_streaming_mode) {
         cuda_stream_selected_cache_release();
         cuda_host_experts_free();
+        cuda_vram_experts_free();
         return;
     }
     /* Start the reader pool here rather than on the first miss: engine open is
