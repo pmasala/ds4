@@ -34580,6 +34580,51 @@ static bool metal_graph_prefill_pipeline_stage_major(
     return ok;
 }
 
+/* Chunk coalescing: under CUDA SSD streaming every prefill chunk re-reads
+ * the full routed-expert set (~72 GiB per layer sweep), so letting N chunks
+ * share one sweep divides prefill SSD traffic by N. The only state that
+ * crosses layers is the residual stream (batch_cur_hc), so each sub-chunk
+ * parks one hc slab host-side while its siblings run the same layer; the
+ * per-layer token order is unchanged, which keeps KV ring, compressor and
+ * indexer state bit-identical to the uncoalesced order. */
+#define DS4_PREFILL_COALESCE_MAX 8u
+
+/* Parking slabs are PLAIN heap on purpose: under WSL2 GPU-PV, pinned host
+ * memory drains the same pool that pages the card's VRAM over-commit, and a
+ * long-context prefill lives on that over-commit — 1 GiB of pinned parking
+ * on top of the 20 GiB expert slab OOMed the model arena at layer 38 of a
+ * ctx-131072 prefill. Unpinned copies cost ~10 s per group-of-4 sweep
+ * against the ~100 GiB of SSD reads the group saves. */
+static float *metal_graph_prefill_park_alloc(uint64_t bytes, int *pinned) {
+    *pinned = 0;
+    return (float *)malloc(bytes);
+}
+static void metal_graph_prefill_park_free(float *p, int pinned) {
+    (void)pinned;
+    free(p);
+}
+
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+static uint32_t metal_graph_prefill_coalesce_chunks(const ds4_gpu_graph *g,
+                                                    bool has_imatrix) {
+    if (!g->ssd_streaming || has_imatrix || g->placement) return 1;
+    const char *env = getenv("DS4_CUDA_PREFILL_COALESCE");
+    if (env && env[0]) {
+        char *end = NULL;
+        const long v = strtol(env, &end, 10);
+        if (end != env && v >= 1 && v <= (long)DS4_PREFILL_COALESCE_MAX)
+            return (uint32_t)v;
+        return 1;
+    }
+    return 4;
+}
+#else
+static uint32_t metal_graph_prefill_coalesce_chunks(const ds4_gpu_graph *g,
+                                                    bool has_imatrix) {
+    (void)g; (void)has_imatrix; return 1;
+}
+#endif
+
 static bool metal_graph_prefill_layer_major(
         ds4_gpu_graph *g,
         const ds4_model       *model,
@@ -34587,21 +34632,26 @@ static bool metal_graph_prefill_layer_major(
         const token_vec       *prompt,
         uint32_t               start,
         uint32_t               n_tokens,
+        uint32_t               sub_cap,   /* 0 = single chunk */
         float                 *logits,
         bool                   show_progress,
         ds4_imatrix_collector *imatrix,
         ds4_session_progress_fn display_progress,
         void                  *display_progress_ud) {
-    if (n_tokens == 0 || n_tokens > g->prefill_cap) return false;
+    const uint32_t eff_sub =
+        (sub_cap != 0 && sub_cap < n_tokens) ? sub_cap : n_tokens;
+    const uint32_t n_sub = n_tokens ? (n_tokens + eff_sub - 1u) / eff_sub : 0;
+    if (n_tokens == 0 || eff_sub > g->prefill_cap) return false;
+    if (n_sub > DS4_PREFILL_COALESCE_MAX) return false;
     if (start > (uint32_t)prompt->len) return false;
     if (n_tokens > (uint32_t)prompt->len - start) return false;
     /* Grow a decode-trimmed prefill scratch back before the token upload. */
-    if (!metal_graph_prefill_scratch_require(g, n_tokens)) return false;
+    if (!metal_graph_prefill_scratch_require(g, eff_sub)) return false;
 
     if (display_progress)
         display_progress(display_progress_ud, "prefill_display", (int)start, prompt->len);
 
-    bool ok = metal_graph_upload_prompt_tokens(metal_graph_prefill_tokens(g), prompt, start, n_tokens);
+    bool ok = metal_graph_upload_prompt_tokens(metal_graph_prefill_tokens(g), prompt, start, eff_sub);
     if (!ok) return false;
 
 #ifdef DS4_ROCM_BUILD
@@ -34612,7 +34662,7 @@ static bool metal_graph_prefill_layer_major(
     }
 #endif
 
-    if (!metal_graph_warmup_prefill_kernels(g, model, weights, n_tokens)) return false;
+    if (!metal_graph_warmup_prefill_kernels(g, model, weights, eff_sub)) return false;
     if (g->placement &&
         !metal_graph_set_active_tier_no_copy(g, g->emb_tier)) {
         return false;
@@ -34631,7 +34681,7 @@ static bool metal_graph_prefill_layer_major(
      */
     const bool throttle = graph_power_throttle_enabled(g);
     const bool callback_split = display_progress != NULL && n_tokens >= 32;
-    const bool split_commands = g->ssd_streaming ||
+    const bool split_commands = g->ssd_streaming || n_sub > 1u ||
                                 split_profile || throttle || callback_split ||
                                 n_tokens > 2048 || imatrix != NULL;
     const bool profile =
@@ -34821,14 +34871,60 @@ static bool metal_graph_prefill_layer_major(
     }
 #endif
 
+    /* Coalesced groups park each sub-chunk's residual stream host-side; the
+     * slabs are freed as soon as the last layer has run. Pinned pages when
+     * the driver grants them, plain heap otherwise. */
+    float *park[DS4_PREFILL_COALESCE_MAX] = {0};
+    int park_pinned[DS4_PREFILL_COALESCE_MAX] = {0};
+    const uint64_t park_row = (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
+#define DS4_PREFILL_PARK_RELEASE() \
+    do { \
+        for (uint32_t _s = 0; _s < n_sub; _s++) { \
+            metal_graph_prefill_park_free(park[_s], park_pinned[_s]); \
+            park[_s] = NULL; \
+        } \
+    } while (0)
+#define DS4_PREFILL_SUB_START(_s) (start + (_s) * eff_sub)
+#define DS4_PREFILL_SUB_LEN(_s) \
+    ((_s) + 1u == n_sub ? n_tokens - (_s) * eff_sub : eff_sub)
+    if (n_sub > 1) {
+        for (uint32_t s = 0; ok && s < n_sub; s++) {
+            park[s] = metal_graph_prefill_park_alloc(
+                    DS4_PREFILL_SUB_LEN(s) * park_row, &park_pinned[s]);
+            if (!park[s]) ok = false;
+        }
+        if (!ok) {
+            DS4_PREFILL_PARK_RELEASE();
+            fprintf(stderr, "ds4: prefill coalesce parking alloc failed\n");
+            return false;
+        }
+    }
+
     double t_layer0 = (profile || throttle) ? now_sec() : 0.0;
-    ok = metal_graph_upload_prompt_embeddings_hc(metal_graph_batch_cur_hc(g),
-                                                 metal_graph_prefill_tokens(g),
-                                                 model,
-                                                 weights,
-                                                 prompt,
-                                                 start,
-                                                 n_tokens);
+    if (n_sub > 1) {
+        /* Embed every sub-chunk up front and park its stream: the layer loop
+         * below replays them in order against each layer's one expert load. */
+        for (uint32_t s = 0; ok && s < n_sub; s++) {
+            const uint32_t s_start = DS4_PREFILL_SUB_START(s);
+            const uint32_t s_len = DS4_PREFILL_SUB_LEN(s);
+            ok = metal_graph_upload_prompt_tokens(metal_graph_prefill_tokens(g),
+                                                  prompt, s_start, s_len) &&
+                 metal_graph_upload_prompt_embeddings_hc(
+                         metal_graph_batch_cur_hc(g),
+                         metal_graph_prefill_tokens(g),
+                         model, weights, prompt, s_start, s_len) &&
+                 ds4_gpu_tensor_read(metal_graph_batch_cur_hc(g), 0, park[s],
+                                     (uint64_t)s_len * park_row) != 0;
+        }
+    } else {
+        ok = metal_graph_upload_prompt_embeddings_hc(metal_graph_batch_cur_hc(g),
+                                                     metal_graph_prefill_tokens(g),
+                                                     model,
+                                                     weights,
+                                                     prompt,
+                                                     start,
+                                                     n_tokens);
+    }
     const double t_embed_encoded = (profile || throttle) ? now_sec() : 0.0;
     const double t_embed_done = (profile || throttle) ? now_sec() : 0.0;
     if (profile) {
@@ -34842,6 +34938,7 @@ static bool metal_graph_prefill_layer_major(
         }
     }
     if (!ok) {
+        DS4_PREFILL_PARK_RELEASE();
 #ifdef DS4_ROCM_BUILD
         (void)rocm_graph_stream_layer_expert_load_join(&rocm_full_layer_load);
         (void)ds4_gpu_stream_expert_cache_release_layer_cache();
@@ -34963,7 +35060,7 @@ static bool metal_graph_prefill_layer_major(
                 metal_graph_stream_readahead_output(model, weights);
             }
         }
-        if (split_profile) {
+        if (split_profile && n_sub == 1u) {
             /* (B6 fix): split-profile diagnostic bypasses the
              * metal_graph_encode_layer_batch wrapper that normally does
              * the per-layer tier switch. Replicate the switch here so the
@@ -35058,34 +35155,56 @@ static bool metal_graph_prefill_layer_major(
                     (t_ffn_done - t_ffn_encoded) * 1000.0);
         } else {
             const double t_chunk0 = (profile || throttle) ? now_sec() : 0.0;
-            ok = ds4_gpu_begin_commands() != 0;
-            if (ok) ok = metal_graph_encode_layer_batch(g,
-                                                        model,
-                                                        &weights->layer[il],
-                                                        il,
-                                                        start,
-                                                        n_tokens);
-            if (!ok) {
-                fprintf(stderr, "ds4: gpu layer-major prefill layer %u encode failed\n", il);
-            }
-            if (ok) ok = metal_graph_dspark_capture_prefill_layer(g,
-                                                                  il,
-                                                                  start,
-                                                                  n_tokens);
-            if (ok) ok = metal_graph_capture_prefill_seed_router_selected(g,
-                                                                          il,
-                                                                          n_tokens);
+            /* Coalesced group: replay every sub-chunk against this layer's
+             * single expert load. Per-layer token order matches the
+             * uncoalesced schedule exactly, so all per-layer state (KV ring,
+             * compressor, indexer) evolves identically; only the residual
+             * stream commutes through the parking slabs. */
+            for (uint32_t s = 0; ok && s < n_sub; s++) {
+                const uint32_t s_start = DS4_PREFILL_SUB_START(s);
+                const uint32_t s_len = DS4_PREFILL_SUB_LEN(s);
+                if (n_sub > 1) {
+                    ok = metal_graph_upload_prompt_tokens(
+                                 metal_graph_prefill_tokens(g),
+                                 prompt, s_start, s_len) &&
+                         ds4_gpu_tensor_write(metal_graph_batch_cur_hc(g), 0,
+                                              park[s],
+                                              (uint64_t)s_len * park_row) != 0;
+                }
+                if (ok) ok = ds4_gpu_begin_commands() != 0;
+                if (ok) ok = metal_graph_encode_layer_batch(g,
+                                                            model,
+                                                            &weights->layer[il],
+                                                            il,
+                                                            s_start,
+                                                            s_len);
+                if (!ok) {
+                    fprintf(stderr, "ds4: gpu layer-major prefill layer %u encode failed\n", il);
+                }
+                if (ok) ok = metal_graph_dspark_capture_prefill_layer(g,
+                                                                      il,
+                                                                      s_start,
+                                                                      s_len);
+                if (ok) ok = metal_graph_capture_prefill_seed_router_selected(g,
+                                                                              il,
+                                                                              s_len);
 #ifdef __APPLE__
-            if (ok && !layer_selected_addr) {
-                ok = metal_graph_seed_streaming_expert_cache_layer_from_mapped_hotlist(
-                        g,
-                        model,
-                        weights,
-                        il);
-            }
+                if (ok && !layer_selected_addr) {
+                    ok = metal_graph_seed_streaming_expert_cache_layer_from_mapped_hotlist(
+                            g,
+                            model,
+                            weights,
+                            il);
+                }
 #endif
+                if (ok) ok = ds4_gpu_end_commands() != 0;
+                if (ok && n_sub > 1) {
+                    ok = ds4_gpu_tensor_read(metal_graph_batch_cur_hc(g), 0,
+                                             park[s],
+                                             (uint64_t)s_len * park_row) != 0;
+                }
+            }
             const double t_encoded = (profile || throttle) ? now_sec() : 0.0;
-            if (ok) ok = ds4_gpu_end_commands() != 0;
             const double t_done = (profile || throttle) ? now_sec() : 0.0;
 #ifdef DS4_ROCM_BUILD
             if (ok) {
@@ -35097,11 +35216,12 @@ static bool metal_graph_prefill_layer_major(
             }
 #endif
             if (ok) {
+                /* The batch buffers hold the LAST sub-chunk's rows here. */
                 ok = metal_graph_stream_prefill_selected_profile_layer(
                         g,
                         &weights->layer[il],
                         il,
-                        n_tokens);
+                        n_sub > 1 ? DS4_PREFILL_SUB_LEN(n_sub - 1u) : n_tokens);
             }
             if (ok && imatrix) ok = imatrix_collect_layer_batch(imatrix, g, il, (uint32_t)n_tokens);
             layer_elapsed = t_done - t_chunk0;
@@ -35143,6 +35263,7 @@ static bool metal_graph_prefill_layer_major(
             }
         }
         if (!ok) {
+            DS4_PREFILL_PARK_RELEASE();
 #ifdef DS4_ROCM_BUILD
             (void)rocm_graph_stream_layer_expert_load_join(&rocm_full_layer_load);
             (void)ds4_gpu_stream_expert_cache_release_layer_cache();
@@ -35169,6 +35290,7 @@ static bool metal_graph_prefill_layer_major(
         }
     }
     if (!ok) {
+        DS4_PREFILL_PARK_RELEASE();
 #ifdef DS4_ROCM_BUILD
         (void)rocm_graph_stream_layer_expert_load_join(&rocm_full_layer_load);
         (void)ds4_gpu_stream_expert_cache_release_layer_cache();
@@ -35182,6 +35304,23 @@ static bool metal_graph_prefill_layer_major(
         }
         return false;
     }
+    /* Coalesced group: the output head reads the LAST sub-chunk's stream;
+     * bring it back before the parking slabs go away. */
+    uint32_t tail_rows = n_tokens;
+    if (n_sub > 1) {
+        const uint32_t last_len = DS4_PREFILL_SUB_LEN(n_sub - 1u);
+        if (logits) {
+            ok = ds4_gpu_tensor_write(metal_graph_batch_cur_hc(g), 0,
+                                      park[n_sub - 1u],
+                                      (uint64_t)last_len * park_row) != 0;
+        }
+        DS4_PREFILL_PARK_RELEASE();
+        if (!ok) return false;
+        tail_rows = last_len;
+    }
+#undef DS4_PREFILL_PARK_RELEASE
+#undef DS4_PREFILL_SUB_START
+#undef DS4_PREFILL_SUB_LEN
 #ifdef __APPLE__
     /* Zero-prefix masks are shared across the 43 per-layer command batches,
      * then become dead weight. Release them before the output head and later
@@ -35213,14 +35352,14 @@ static bool metal_graph_prefill_layer_major(
     }
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
-    uint32_t output_row = (uint32_t)n_tokens - 1u;
+    uint32_t output_row = tail_rows - 1u;
     const char *output_row_env = glm_graph_env_value(
             "DS4_ROCM_GRAPH_OUTPUT_ROW",
             "DS4_METAL_GRAPH_OUTPUT_ROW");
     if (output_row_env && output_row_env[0]) {
         char *end = NULL;
         unsigned long v = strtoul(output_row_env, &end, 10);
-        if (end != output_row_env && v < (unsigned long)n_tokens) {
+        if (end != output_row_env && v < (unsigned long)tail_rows) {
             output_row = (uint32_t)v;
         }
     }
@@ -35332,6 +35471,7 @@ static bool metal_graph_prefill_raw_swa(
                                            prompt,
                                            0,
                                            (uint32_t)n_tokens,
+                                           0,
                                            logits,
                                            show_progress,
                                            NULL,
@@ -35422,14 +35562,33 @@ static bool metal_graph_prefill_chunked_range(
             }
         }
         const uint32_t chunk = remaining < local_cap ? remaining : local_cap;
-        const uint32_t chunk_end = pos0 + chunk;
+        /* Chunk coalescing: extend this call over the next chunks so they
+         * share one layer sweep — each sweep reads the full routed-expert
+         * set from SSD, so a group of N divides that traffic by N. Only
+         * cap-aligned full-size chunks group; the boundary-alignment and
+         * tail cases keep today's one-chunk shape. */
+        uint32_t group = chunk;
+        uint32_t subs = 1;
+        if (chunk == local_cap && local_cap == chunk_cap) {
+            const uint32_t coalesce =
+                metal_graph_prefill_coalesce_chunks(g, imatrix != NULL);
+            while (subs < coalesce && pos0 + group < end) {
+                uint32_t nxt = end - (pos0 + group);
+                if (nxt > chunk_cap) nxt = chunk_cap;
+                group += nxt;
+                subs++;
+                if (nxt < chunk_cap) break;
+            }
+        }
+        const uint32_t chunk_end = pos0 + group;
         float *chunk_logits = (progress || chunk_end == end) ? logits : NULL;
         bool ok = metal_graph_prefill_layer_major(g,
                                                   model,
                                                   weights,
                                                   prompt,
                                                   pos0,
-                                                  chunk,
+                                                  group,
+                                                  subs > 1 ? chunk_cap : 0,
                                                   chunk_logits,
                                                   show_progress,
                                                   imatrix,
@@ -52841,6 +53000,7 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
                     ok = metal_graph_prefill_layer_major(&g, model, weights,
                                                          &prompt, 0,
                                                          (uint32_t)prompt.len,
+                                                         0,
                                                          NULL, false,
                                                          &collector,
                                                          NULL, NULL);
@@ -59918,6 +60078,7 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                                                  &span,
                                                  0,
                                                  n_tokens,
+                                                 0,
                                                  logits,
                                                  false,
                                                  NULL,
@@ -59947,6 +60108,7 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                                                      &span,
                                                      pos0,
                                                      n_tokens,
+                                                     0,
                                                      logits,
                                                      false,
                                                      NULL,

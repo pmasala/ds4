@@ -501,6 +501,7 @@ extern "C" void ds4_gpu_stream_vram_tier_release(void) {
     cuda_vram_experts_free();
 }
 
+
 /* Fraction of the VRAM that is free at first decode which the tier may take.
  * The remainder covers cuBLAS workspaces, the scratch arena, and driver
  * bookkeeping, none of which are in this accounting. */
@@ -892,10 +893,17 @@ static void cuda_host_experts_note_token(uint32_t layer) {
         g_host_experts.decode_tokens != UINT64_MAX) {
         g_host_experts.decode_tokens++;
         /* Decode has begun: drop the startup model load from the re-fetch
-         * counter so what it reports is per-token eviction, not warm-up. */
+         * counter so what it reports is per-token eviction, not warm-up.
+         * The host tier now serves prefill too, so its hit/read/H2D stats
+         * also restart here to stay per-decode-token quantities. */
         if (g_host_experts.decode_tokens == 1u) {
             g_model_range_h2d_bytes = 0;
             g_expert_upload_wait_s = 0.0;
+            g_host_experts.hits = 0;
+            g_host_experts.misses = 0;
+            g_expert_h2d_bytes = 0;
+            __atomic_store_n(&g_expert_read_bytes, 0ull, __ATOMIC_RELAXED);
+            __atomic_store_n(&g_expert_read_calls, 0ull, __ATOMIC_RELAXED);
         }
         if (g_host_experts.decode_tokens %
             DS4_CUDA_HOST_EXPERT_HOTNESS_DECAY_TOKENS == 0u) {
@@ -27323,8 +27331,13 @@ static int cuda_stream_selected_cache_begin_load(
         cuda_stream_selected_cache_invalidate();
         return 0;
     }
+    /* The host tier serves prefill too: with chunk-coalesced prefill the
+     * subs of one layer request near-identical expert unions back to back,
+     * so the first sub's installs turn every later sub's read into a RAM
+     * hit; across uncoalesced chunks the cache still catches whatever of
+     * the layer cycle fits. It also leaves the tier warm for decode, which
+     * used to start cold. Decode-only remains: the VRAM tier below. */
     const int use_host =
-        decode &&
         cuda_host_experts_prepare(n_total, table->gate_expert_bytes,
                                   table->down_expert_bytes) &&
         cuda_host_experts_ensure_maps(table->layer);
