@@ -134,6 +134,12 @@ void ds4_gpu_plan_streaming_vram(uint64_t model_bytes,
                                  uint64_t buffer_bytes,
                                  uint64_t stream_bytes,
                                  uint64_t routed_working_set_bytes);
+
+/* The graph's chunk-sized prefill scratch trims itself at the first streamed
+ * decode token so the VRAM expert tier can absorb the freed bytes, and grows
+ * back for the next prefill chunk. A re-grow that finds the tier sitting on
+ * those bytes may reclaim its slab — it is a cache, dropping it is safe. */
+void ds4_gpu_stream_vram_tier_release(void);
 #ifdef DS4_ROCM_BUILD
 void ds4_gpu_release_q8_f16_cache(void);
 #endif

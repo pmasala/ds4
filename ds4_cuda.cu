@@ -493,6 +493,14 @@ static void cuda_vram_experts_free(void) {
     g_vram_experts.slot_used.clear();
 }
 
+/* CUDA side of the graph's prefill-scratch hand-off (ds4.c): a re-grow that
+ * finds the expert tier sitting on the bytes it needs may reclaim the slab —
+ * it is a cache, the next decode load rebuilds it from the free VRAM it
+ * finds then. */
+extern "C" void ds4_gpu_stream_vram_tier_release(void) {
+    cuda_vram_experts_free();
+}
+
 /* Fraction of the VRAM that is free at first decode which the tier may take.
  * The remainder covers cuBLAS workspaces, the scratch arena, and driver
  * bookkeeping, none of which are in this accounting. */
@@ -528,6 +536,12 @@ static int cuda_vram_experts_alloc(uint64_t slot_bytes, uint32_t n_total) {
             return 0;
         }
         budget = (uint64_t)((double)free_b * cuda_vram_experts_take_fraction());
+        /* Sizing from anything other than what the driver reports free has
+         * been tried and measured as a loss: forcing the tier into bytes the
+         * trim provably freed pushed WSL2 GPU-PV into VRAM paging (H2D 13.6
+         * -> 3.8 GB/s, decode 3.86 -> 1.06 t/s), because the freed bytes had
+         * themselves been allocated into over-commit. Free-as-reported is
+         * the one budget that cannot start a paging debt. */
     }
 
     uint64_t cap = budget / slot_bytes;
@@ -535,8 +549,11 @@ static int cuda_vram_experts_alloc(uint64_t slot_bytes, uint32_t n_total) {
     if (cap == 0) {
         g_vram_experts.disabled = 1;
         fprintf(stderr,
-                "ds4: CUDA VRAM expert tier disabled (no spare VRAM); "
-                "experts keep crossing PCIe every token\n");
+                "ds4: CUDA VRAM expert tier disabled (no spare VRAM, "
+                "budget %.0f MiB < one %.0f MiB slot); "
+                "experts keep crossing PCIe every token\n",
+                (double)budget / 1048576.0,
+                (double)slot_bytes / 1048576.0);
         return 0;
     }
 

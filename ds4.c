@@ -15074,6 +15074,15 @@ typedef struct {
      * for every ratio-128 layer. */
     uint32_t layer_comp_cap[DS4_MAX_LAYER];
     uint32_t attn_comp_stage_cap;
+    /* Current row capacity, in tokens, of every prefill-chunk-sized scratch
+     * tensor: the batch_* workspace plus indexer_scores/comp_mask. Allocated
+     * for a full chunk, trimmed to 1 row at the first streamed CUDA decode
+     * token (several GiB at prefill_cap 4096) so the VRAM expert tier can
+     * absorb the bytes, grown back by the batch entry points. trim_ok is set
+     * by the engine at session-graph creation: CUDA SSD streaming without
+     * DSpark, the one mode whose decode provably reads a single row. */
+    uint32_t prefill_scratch_rows;
+    bool prefill_scratch_trim_ok;
 
     /* Class P (per-layer work tensors). Each used tier has its
      * own replica. They are reused in place by every layer instead of
@@ -15724,6 +15733,7 @@ static void metal_graph_transfer_prefill_workspace(
     dst->prefill_cap = src->prefill_cap;
     dst->emb_tier = src->emb_tier;
     dst->owns_prefill_workspace = true;
+    dst->prefill_scratch_rows = src->prefill_scratch_rows;
     metal_graph_copy_prefill_workspace_pointers(dst, src);
     src->owns_prefill_workspace = false;
 }
@@ -15755,6 +15765,78 @@ static void metal_graph_free_prefill_workspace(ds4_gpu_graph *g) {
     g->batch_q_half = NULL;
     g->prefill_seed_router_selected = NULL;
     g->owns_prefill_workspace = false;
+}
+
+/* Per-row byte width of every chunk-sized workspace tensor: the companion of
+ * DS4_GPU_PREFILL_WORKSPACE_FIELDS for (re)allocation at a chosen row count.
+ * prefill_tokens is emb-tier-only and allocated separately. The weight-derived
+ * widths (q_rank, shared, routed mid) use the model constants directly;
+ * tensor_expect_layout pins the weights to them, the same equivalence
+ * engine_per_tier_graph_overhead_bytes already relies on. */
+#define DS4_GPU_PREFILL_WORKSPACE_ROW_BYTES(X) \
+    X(batch_cur_hc,          ((uint64_t)DS4_N_HC * DS4_N_EMBD) * sizeof(float)) \
+    X(batch_next_hc,         ((uint64_t)DS4_N_HC * DS4_N_EMBD) * sizeof(float)) \
+    X(batch_flat_hc,         ((uint64_t)DS4_N_HC * DS4_N_EMBD) * sizeof(float)) \
+    X(batch_hc_mix,          (2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC) * sizeof(float)) \
+    X(batch_hc_split,        (2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC) * sizeof(float)) \
+    X(batch_attn_cur,        (uint64_t)DS4_N_EMBD * sizeof(float)) \
+    X(batch_attn_norm,       (uint64_t)DS4_N_EMBD * sizeof(float)) \
+    X(batch_qr,              (uint64_t)DS4_N_LORA_Q * sizeof(float)) \
+    X(batch_qr_norm,         (uint64_t)DS4_N_LORA_Q * sizeof(float)) \
+    X(batch_q,               ((uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM) * sizeof(float)) \
+    X(batch_kv_raw,          (uint64_t)DS4_N_HEAD_DIM * sizeof(float)) \
+    X(batch_kv,              (uint64_t)DS4_N_HEAD_DIM * sizeof(float)) \
+    X(batch_comp_kv,         (2ull * (DS4_N_HEAD_DIM > DS4_N_INDEXER_HEAD_DIM ? DS4_N_HEAD_DIM : DS4_N_INDEXER_HEAD_DIM)) * sizeof(float)) \
+    X(batch_comp_sc,         (2ull * (DS4_N_HEAD_DIM > DS4_N_INDEXER_HEAD_DIM ? DS4_N_HEAD_DIM : DS4_N_INDEXER_HEAD_DIM)) * sizeof(float)) \
+    X(batch_indexer_q,       ((uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM) * sizeof(float)) \
+    X(batch_indexer_weights, (uint64_t)DS4_N_INDEXER_HEAD * sizeof(float)) \
+    X(batch_heads,           ((uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM) * sizeof(float)) \
+    X(batch_attn_low,        ((uint64_t)DS4_N_OUT_GROUP * DS4_N_LORA_O) * sizeof(float)) \
+    X(batch_attn_out,        (uint64_t)DS4_N_EMBD * sizeof(float)) \
+    X(batch_group_tmp,       ((uint64_t)DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP)) * sizeof(float)) \
+    X(batch_low_tmp,         (uint64_t)DS4_N_LORA_O * sizeof(float)) \
+    X(batch_after_attn_hc,   ((uint64_t)DS4_N_HC * DS4_N_EMBD) * sizeof(float)) \
+    X(batch_ffn_cur,         (uint64_t)DS4_N_EMBD * sizeof(float)) \
+    X(batch_ffn_norm,        (uint64_t)DS4_N_EMBD * sizeof(float)) \
+    X(batch_shared_gate,     (uint64_t)DS4_N_FF_EXP * sizeof(float)) \
+    X(batch_shared_up,       (uint64_t)DS4_N_FF_EXP * sizeof(float)) \
+    X(batch_shared_mid,      (uint64_t)DS4_N_FF_EXP * sizeof(float)) \
+    X(batch_shared_out,      (uint64_t)DS4_N_EMBD * sizeof(float)) \
+    X(batch_router_logits,   (uint64_t)DS4_N_EXPERT * sizeof(float)) \
+    X(batch_router_probs,    (uint64_t)DS4_N_EXPERT * sizeof(float)) \
+    X(batch_router_selected, (uint64_t)DS4_N_EXPERT_USED * sizeof(int)) \
+    X(batch_router_weights,  (uint64_t)DS4_N_EXPERT_USED * sizeof(float)) \
+    X(batch_routed_gate,     ((uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP) * sizeof(float)) \
+    X(batch_routed_up,       ((uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP) * sizeof(float)) \
+    X(batch_routed_mid,      ((uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP) * sizeof(float)) \
+    X(batch_routed_down,     ((uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD) * sizeof(float)) \
+    X(batch_routed_out,      (uint64_t)DS4_N_EMBD * sizeof(float)) \
+    X(batch_ffn_out,         (uint64_t)DS4_N_EMBD * sizeof(float))
+
+/* (Re)allocate the chunk-sized workspace at a capacity of `rows` tokens on
+ * every used tier (recognised by Class P comp_kv_cur, allocated before the
+ * first call here and never resized). Frees whatever was there first, so it
+ * serves the initial graph alloc, the streamed-decode trim to one row, and
+ * the grow-back at the batch entry points alike. */
+static bool metal_graph_prefill_batch_scratch_alloc(ds4_gpu_graph *g,
+                                                    uint32_t        rows) {
+    if (rows == 0) rows = 1;
+    const uint64_t pc = rows;
+    ds4_gpu_tensor_free(g->prefill_tokens_by_tier[g->emb_tier]);
+    g->prefill_tokens_by_tier[g->emb_tier] =
+        ds4_gpu_tensor_alloc_ptr_on(g->emb_tier, pc * sizeof(int32_t));
+    bool ok = g->prefill_tokens_by_tier[g->emb_tier] != NULL;
+    for (int t = 0; ok && t < DS4_MAX_GPUS; t++) {
+        if (!g->comp_kv_cur_by_tier[t]) continue;
+#define DS4_ALLOC_WORKSPACE_ROW(name, row_bytes)                        \
+        ds4_gpu_tensor_free(g->name##_by_tier[t]);                      \
+        g->name##_by_tier[t] =                                          \
+            ds4_gpu_tensor_alloc_ptr_on(t, pc * (row_bytes));           \
+        ok = ok && g->name##_by_tier[t] != NULL;
+        DS4_GPU_PREFILL_WORKSPACE_ROW_BYTES(DS4_ALLOC_WORKSPACE_ROW)
+#undef DS4_ALLOC_WORKSPACE_ROW
+    }
+    return ok;
 }
 
 /* Release every Metal tensor owned by the whole-model graph runtime. */
@@ -17016,7 +17098,6 @@ static bool metal_graph_alloc_raw_cap(
     const uint64_t q_rank = layer->attn_q_a->dim[1];
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
     const uint64_t low_dim = (uint64_t)DS4_N_OUT_GROUP * DS4_N_LORA_O;
-    const uint64_t group_dim = (uint64_t)DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP);
     const uint64_t shared_dim = layer->ffn_gate_shexp->dim[1];
     const uint64_t routed_mid_dim = layer->ffn_gate_exps->dim[1];
     /* Distributed coordinators do not normally own the output head. The
@@ -17220,6 +17301,7 @@ static bool metal_graph_alloc_raw_cap(
     /* Class P per-layer decode scratch + routed-expert state —
      * replicated across every used tier. ffn_out is lazily allocated by
      * metal_graph_ensure_ffn_out (per-tier on first touch). */
+    g->prefill_scratch_rows = (uint32_t)pc;
     for (int t = 0; t < DS4_MAX_GPUS; t++) {
         if (!used_tier[t]) continue;
         g->comp_kv_cur_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, comp_width_max * sizeof(float));
@@ -17373,49 +17455,14 @@ static bool metal_graph_alloc_raw_cap(
             metal_graph_copy_prefill_workspace_pointers(
                     g, shared_prefill_workspace);
         }
+        /* Shared pointers, shared capacity: a non-owner never resizes, so
+         * mirror the owner's row count for the require() checks. */
+        g->prefill_scratch_rows = shared_prefill_workspace->prefill_scratch_rows;
     } else {
-        g->prefill_tokens_by_tier[g->emb_tier] =
-            ds4_gpu_tensor_alloc_ptr_on(g->emb_tier, pc * sizeof(int32_t));
-        for (int t = 0; t < DS4_MAX_GPUS; t++) {
-            if (!used_tier[t]) continue;
-            g->batch_cur_hc_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * hc_dim * sizeof(float));
-            g->batch_next_hc_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * hc_dim * sizeof(float));
-            g->batch_flat_hc_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * hc_dim * sizeof(float));
-            g->batch_hc_mix_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * mix_hc * sizeof(float));
-            g->batch_hc_split_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * mix_hc * sizeof(float));
-            g->batch_attn_cur_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * DS4_N_EMBD * sizeof(float));
-            g->batch_attn_norm_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * DS4_N_EMBD * sizeof(float));
-            g->batch_qr_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * q_rank * sizeof(float));
-            g->batch_qr_norm_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * q_rank * sizeof(float));
-            g->batch_q_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * q_dim * sizeof(float));
-            g->batch_kv_raw_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * DS4_N_HEAD_DIM * sizeof(float));
-            g->batch_kv_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * DS4_N_HEAD_DIM * sizeof(float));
-            g->batch_comp_kv_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * comp_width_max * sizeof(float));
-            g->batch_comp_sc_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * comp_width_max * sizeof(float));
-            g->batch_indexer_q_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * indexer_q_dim * sizeof(float));
-            g->batch_indexer_weights_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * DS4_N_INDEXER_HEAD * sizeof(float));
-            g->batch_heads_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * q_dim * sizeof(float));
-            g->batch_attn_low_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * low_dim * sizeof(float));
-            g->batch_attn_out_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * DS4_N_EMBD * sizeof(float));
-            g->batch_group_tmp_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * group_dim * sizeof(float));
-            g->batch_low_tmp_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * DS4_N_LORA_O * sizeof(float));
-            g->batch_after_attn_hc_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * hc_dim * sizeof(float));
-            g->batch_ffn_cur_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * DS4_N_EMBD * sizeof(float));
-            g->batch_ffn_norm_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * DS4_N_EMBD * sizeof(float));
-            g->batch_shared_gate_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * shared_dim * sizeof(float));
-            g->batch_shared_up_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * shared_dim * sizeof(float));
-            g->batch_shared_mid_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * shared_dim * sizeof(float));
-            g->batch_shared_out_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * DS4_N_EMBD * sizeof(float));
-            g->batch_router_logits_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * DS4_N_EXPERT * sizeof(float));
-            g->batch_router_probs_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * DS4_N_EXPERT * sizeof(float));
-            g->batch_router_selected_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * DS4_N_EXPERT_USED * sizeof(int));
-            g->batch_router_weights_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * DS4_N_EXPERT_USED * sizeof(float));
-            g->batch_routed_gate_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
-            g->batch_routed_up_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
-            g->batch_routed_mid_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
-            g->batch_routed_down_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float));
-            g->batch_routed_out_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, pc * DS4_N_EMBD * sizeof(float));
-        }
+        /* The chunk-sized workspace itself: one helper call so the streamed
+         * decode trim and the batch-entry grow-back allocate exactly what is
+         * allocated here (metal_graph_prefill_batch_scratch_alloc). */
+        (void)metal_graph_prefill_batch_scratch_alloc(g, (uint32_t)pc);
         if (DS4_GPU_ATTN_COMP_CACHE_F16) {
             g->batch_q_half = ds4_gpu_tensor_alloc(pc * q_dim * sizeof(uint16_t));
         }
@@ -21827,6 +21874,82 @@ static bool metal_graph_cuda_tp_ep_finish_reduce(
     return ok;
 }
 
+/* indexer_scores and comp_mask are the graph's two largest scratch tensors:
+ * comp_cap x prefill_cap floats each — 0.5 GiB each at ctx 131072 — sized for
+ * a whole prefill chunk but read one row deep by decode. Under CUDA SSD
+ * streaming that idle VRAM is exactly what the routed-expert tier wants, so
+ * their capacity follows the phase: the streamed decode path trims them to
+ * one row before the expert tier sizes itself from free VRAM, and the batch
+ * path grows them back for the chunk it is about to encode. Metal keeps the
+ * fixed allocation; nothing there competes for the memory. */
+/* indexer_scores and comp_mask are chunk-sized like the batch workspace but
+ * live outside its field list (comp_cap x rows floats each — 0.5 GiB each at
+ * ctx 131072, prefill_cap 4096), so the resize below handles them alongside
+ * the workspace helper. */
+static bool metal_graph_indexer_scratch_alloc(ds4_gpu_graph *g,
+                                              uint32_t        rows) {
+    for (int t = 0; t < DS4_MAX_GPUS; t++) {
+        if (!g->comp_kv_cur_by_tier[t]) continue;
+        ds4_gpu_tensor_free(g->indexer_scores_by_tier[t]);
+        ds4_gpu_tensor_free(g->comp_mask_by_tier[t]);
+        const uint64_t bytes = (uint64_t)g->comp_cap * rows * sizeof(float);
+        g->indexer_scores_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, bytes);
+        g->comp_mask_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, bytes);
+        if (!g->indexer_scores_by_tier[t] || !g->comp_mask_by_tier[t]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Set every chunk-sized scratch tensor — the batch workspace plus the
+ * indexer pair — to a capacity of `rows` tokens. The streamed decode path
+ * trims to one row (decode provably reads a single row of each) so the VRAM
+ * expert tier, sized from free VRAM at the first decode load, absorbs the
+ * several GiB a prefill_cap-4096 workspace occupies; the batch entry points
+ * grow it back for the chunk they are about to encode. Only the workspace
+ * owner may resize: members share the owner's pointers. */
+static uint64_t metal_graph_prefill_scratch_bytes(const ds4_gpu_graph *g) {
+    uint64_t total = metal_graph_prefill_workspace_bytes(g);
+    for (int t = 0; t < DS4_MAX_GPUS; t++) {
+        total += ds4_gpu_tensor_bytes(g->indexer_scores_by_tier[t]);
+        total += ds4_gpu_tensor_bytes(g->comp_mask_by_tier[t]);
+    }
+    return total;
+}
+
+static bool metal_graph_prefill_scratch_resize(ds4_gpu_graph *g,
+                                               uint32_t        rows) {
+    if (rows == 0) rows = 1;
+    if (!g->owns_prefill_workspace) return false;
+    const uint64_t bytes_before = metal_graph_prefill_scratch_bytes(g);
+    bool ok = metal_graph_prefill_batch_scratch_alloc(g, rows) &&
+              metal_graph_indexer_scratch_alloc(g, rows);
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (!ok) {
+        /* The routed-expert VRAM tier may be sitting on the bytes this grow
+         * needs; it is a cache, so reclaim it and retry once. The next decode
+         * load rebuilds it from whatever is free then. */
+        ds4_gpu_stream_vram_tier_release();
+        ok = metal_graph_prefill_batch_scratch_alloc(g, rows) &&
+             metal_graph_indexer_scratch_alloc(g, rows);
+    }
+#endif
+    if (!ok) return false;
+    const uint64_t bytes_after = metal_graph_prefill_scratch_bytes(g);
+    fprintf(stderr, "ds4: prefill scratch resized %u -> %u rows (%+.2f GiB)\n",
+            g->prefill_scratch_rows, rows,
+            ((double)bytes_after - (double)bytes_before) / 1073741824.0);
+    g->prefill_scratch_rows = rows;
+    return true;
+}
+
+static bool metal_graph_prefill_scratch_require(ds4_gpu_graph *g,
+                                                uint32_t        rows) {
+    if (rows <= g->prefill_scratch_rows) return true;
+    return metal_graph_prefill_scratch_resize(g, rows);
+}
+
 typedef enum {
     METAL_DECODE_LAYER_FULL = 0,
     METAL_DECODE_LAYER_TO_FFN,
@@ -21894,6 +22017,15 @@ static bool metal_graph_encode_decode_layer_phase(
     if (g->placement) {
         const int this_tier = g->placement[il + 1];
         if (!metal_graph_set_active_tier_decode(g, this_tier)) return false;
+    }
+    /* First streamed decode token: hand the chunk-sized prefill scratch back
+     * to the card before the routed-expert VRAM tier sizes itself from free
+     * VRAM (its alloc runs later this same token, at the first expert load).
+     * Nothing this token has written yet lives in those buffers. trim_ok is
+     * engine-set for CUDA SSD streaming only. */
+    if (g->prefill_scratch_trim_ok && g->prefill_scratch_rows > 1u &&
+        !metal_graph_prefill_scratch_resize(g, 1u)) {
+        return false;
     }
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
@@ -28122,6 +28254,9 @@ static bool metal_graph_encode_layer_attention_batch(
         uint32_t                pos0,
         uint32_t                n_tokens) {
     if (n_tokens == 0 || n_tokens > g->prefill_cap) return false;
+    /* A trimmed prefill scratch (see the streamed-decode path) grows back to
+     * the chunk about to be encoded. No-op while it is already big enough. */
+    if (!metal_graph_prefill_scratch_require(g, n_tokens)) return false;
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
@@ -34460,6 +34595,8 @@ static bool metal_graph_prefill_layer_major(
     if (n_tokens == 0 || n_tokens > g->prefill_cap) return false;
     if (start > (uint32_t)prompt->len) return false;
     if (n_tokens > (uint32_t)prompt->len - start) return false;
+    /* Grow a decode-trimmed prefill scratch back before the token upload. */
+    if (!metal_graph_prefill_scratch_require(g, n_tokens)) return false;
 
     if (display_progress)
         display_progress(display_progress_ud, "prefill_display", (int)start, prompt->len);
@@ -48796,6 +48933,11 @@ static int generate_metal_graph_raw_swa(
     g.ssd_streaming = ssd_streaming;
     g.ssd_streaming_cold = ssd_streaming_cold;
     g.streaming_preload_experts = ssd_streaming_preload_experts;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    /* CLI one-shot graph: same trim eligibility the session path grants —
+     * CUDA SSD streaming, and no DSpark on this call site. */
+    g.prefill_scratch_trim_ok = ssd_streaming;
+#endif
     g.power_percent = power_percent > 0 ? (uint32_t)power_percent : 100u;
     if (!metal_graph_load_directional_steering(&g,
                                                directional_steering_file,
@@ -58980,6 +59122,12 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         free(s);
         return 1;
     }
+    /* Streamed CUDA decode reads one row of the chunk-sized prefill scratch,
+     * so the graph may trim it to give the VRAM expert tier the bytes.
+     * DSpark decodes in blocks through the same workspace, so it keeps the
+     * full allocation. */
+    s->graph.prefill_scratch_trim_ok =
+        e->backend == DS4_BACKEND_CUDA && e->ssd_streaming && !e->dspark;
     if (e->share_session_prefill_workspace &&
         !e->shared_prefill_workspace_ready) {
         bool workspace_ok = true;
@@ -59939,8 +60087,8 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         .cap = (int)n_tokens,
     };
 
-    bool ok = true;
-    if (g->ssd_streaming && !input_hc) {
+    bool ok = metal_graph_prefill_scratch_require(g, n_tokens);
+    if (ok && g->ssd_streaming && !input_hc) {
         g->streaming_static_decode_map_current = false;
         ok = metal_graph_stream_map_token(&e->model, &e->weights);
     }
@@ -62593,6 +62741,14 @@ static int ds4_sessions_eval_batch_with_prefill_metal(
     const uint32_t rows = (uint32_t)prefill_prompt->len - start;
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const bool mirror = e->tp.active && e->tp.rank == 0;
+
+    /* The workspace may be trimmed to one row by a streamed decode; this
+     * entry uploads into it before any layer encode runs, so grow it here. */
+    if (!metal_graph_prefill_scratch_require(pg, rows)) {
+        if (err && errlen) snprintf(err, errlen,
+                                    "prefill scratch alloc failed");
+        return 1;
+    }
 
     if (mirror) {
         ds4_tp_batch_item *wire = ds4_sessions_tp_batch_items(items, count);
@@ -66151,6 +66307,13 @@ static bool metal_graph_eval_mixed_prefill_decode(
     if (!metal_graph_mixed_prefill_decode_supported(
                 prefill_session, prompt, start, prefill_rows,
                 decode_items, decode_count, weights)) {
+        return false;
+    }
+    /* Grow a decode-trimmed prefill scratch back: this mixed pass writes
+     * prefill_rows + decode_count rows into the workspace. */
+    if (!metal_graph_prefill_scratch_require(
+                &prefill_session->graph,
+                prefill_rows + (uint32_t)decode_count)) {
         return false;
     }
 
