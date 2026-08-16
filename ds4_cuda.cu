@@ -149,6 +149,12 @@ static struct {
     uint64_t margin;        /* one token's routed experts, see the plan fn */
     uint64_t model_bytes;   /* the resident (non-routed) weight total: the
                              * weight cache can never legitimately exceed it */
+    uint64_t cache_room;    /* capacity less KV, buffers and streaming — the
+                             * most the weight cache may ever hold. Kept
+                             * separately from spare because spare clamps at
+                             * zero exactly where this matters (long ctx),
+                             * and spare+model would then under-report the
+                             * room by the deficit. */
     uint64_t workspace;     /* chunk-sized prefill activation workspace,
                              * noted late — only a prompt's arrival sizes it */
     int      q8_f16_pool;   /* 1 if the pool is affordable */
@@ -577,6 +583,8 @@ static double cuda_vram_experts_take_fraction(void) {
     return 0.60;
 }
 
+static uint64_t cuda_resident_gap_bytes(void);
+
 static int cuda_vram_experts_alloc(uint64_t slot_bytes, uint32_t n_total) {
     if (g_vram_experts.disabled || slot_bytes == 0 || n_total == 0) return 0;
     if (g_vram_experts.cap != 0) return 1;
@@ -595,7 +603,15 @@ static int cuda_vram_experts_alloc(uint64_t slot_bytes, uint32_t n_total) {
             g_vram_experts.disabled = 1;
             return 0;
         }
-        budget = (uint64_t)((double)free_b * cuda_vram_experts_take_fraction());
+        /* Unpromoted resident weights outrank the tier: a byte of residency
+         * saves its bus cost EVERY token deterministically, while a tier
+         * byte saves only its hit-rate's worth of the same, and a tier that
+         * grabs the free VRAM first starves the lazy promotion forever
+         * (measured at ctx 131072: decode parked at 2.4 t/s on the
+         * per-layer staging path against 4.1 with residency complete). */
+        const uint64_t gap = cuda_resident_gap_bytes();
+        const uint64_t avail = (uint64_t)free_b > gap ? (uint64_t)free_b - gap : 0;
+        budget = (uint64_t)((double)avail * cuda_vram_experts_take_fraction());
         /* Sizing from anything other than what the driver reports free has
          * been tried and measured as a loss: forcing the tier into bytes the
          * trim provably freed pushed WSL2 GPU-PV into VRAM paging (H2D 13.6
@@ -2487,6 +2503,12 @@ extern "C" void ds4_gpu_plan_streaming_vram(uint64_t model_bytes,
      * beside the workspace, not instead of it. */
     g_vram_plan.margin = routed_working_set_bytes;
     g_vram_plan.model_bytes = model_bytes;
+    {
+        const uint64_t static_terms = kv_bytes + buffer_bytes + stream_total;
+        g_vram_plan.cache_room =
+            g_vram_capacity_at_init > static_terms
+                ? g_vram_capacity_at_init - static_terms : 0;
+    }
     g_vram_plan.valid = 1;
     g_vram_plan.q8_f16_pool =
         routed_working_set_bytes != 0 &&
@@ -2593,33 +2615,20 @@ extern "C" void ds4_gpu_stream_scratch_trimmed(void) {
      * a doomed cudaMalloc each. The trim just returned the workspace to the
      * card, so the latch no longer describes reality. */
     g_model_cache_full = 0;
-    /* Promote only into bytes the driver reports free right now, less the
-     * margin (the VRAM expert tier and decode transients live there). On
-     * WSL2 GPU-PV cudaMalloc happily allocates into paging debt — a promote
-     * loop that stops "when allocation fails" stops minutes too late
-     * (measured: 6.45 GiB promoted at ctx 16384, decode 0.46 t/s). Reading
-     * free at this settled boundary is not the mid-flight snapshot the plan
-     * comment forbids. */
-    uint64_t promote_budget = 0;
-    {
-        /* The floor is the loader's staging arena, the one decode-time
-         * consumer that still needs VRAM after this point. Anything larger
-         * (a full expert-tier reservation) is a bad trade: an unpromoted
-         * span costs its bytes over the bus EVERY token, deterministically,
-         * while the tier saves only its hit-rate's worth of the same. */
-        const uint64_t floor_b = cuda_stream_stage_budget_bytes();
-        size_t free_b = 0, total_b = 0;
-        if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess &&
-            (uint64_t)free_b > floor_b) {
-            promote_budget = (uint64_t)free_b - floor_b;
-        }
-    }
+    /* Promote to full residency. The static limit (cache_room, checked
+     * inside the FD path) keeps cache + KV + streaming under the card's
+     * capacity, so this may run mildly past the driver's reported free —
+     * which undercounts by its cold transients. That trespass is the
+     * pre-plan behavior that measured 4.1-4.2 t/s at ctx 131072; stopping
+     * at reported free instead leaves a gap the decode re-stages EVERY
+     * token (measured 3.07 t/s). The one historical promote disaster
+     * (6.45 GiB -> 0.46 t/s at ctx 16384) predates the trim of the
+     * prefill-high-water scratch above, which is what created real room. */
     const uint64_t before = g_model_range_bytes;
     for (const auto &s : g_resident_spans) {
         if (cuda_model_range_is_cached(g_resident_spans_map, s.first, s.second)) {
             continue;
         }
-        if (g_model_range_bytes - before + s.second > promote_budget) break;
         if (g_vram_plan.valid &&
             g_model_range_bytes + s.second > g_vram_plan.model_bytes) {
             break;
@@ -2632,11 +2641,9 @@ extern "C" void ds4_gpu_stream_scratch_trimmed(void) {
     if (g_model_range_bytes != before) {
         fprintf(stderr,
                 "ds4: CUDA promoted %.2f GiB of resident weights into the "
-                "trimmed workspace's VRAM (weight cache %.2f GiB, "
-                "promote budget %.2f GiB)\n",
+                "trimmed workspace's VRAM (weight cache %.2f GiB)\n",
                 (double)(g_model_range_bytes - before) / 1073741824.0,
-                (double)g_model_range_bytes / 1073741824.0,
-                (double)promote_budget / 1073741824.0);
+                (double)g_model_range_bytes / 1073741824.0);
     }
 }
 
@@ -3599,17 +3606,27 @@ static uint64_t cuda_model_cache_limit_bytes(void) {
      * prevent. Outside a streamed plan the historical unbounded behavior
      * stands. */
     if (g_ssd_streaming_mode && g_vram_plan.valid) {
-        uint64_t limit = g_vram_plan.spare + g_vram_plan.model_bytes;
+        uint64_t limit = g_vram_plan.cache_room;
         /* workspace/2 stands in for the chunk-scaled prefill transients the
          * margin cannot see: the MMQ activation pool, the attention-output
          * GEMM scratch and the token-tile mirrors together measure ~0.5
          * MiB/row against the workspace's ~1 MiB/row (ctx 16384, chunk
          * 4096: ~2 GiB beside a 4 GiB workspace). Without this term the
          * cache fills the room those allocations need and the first big
-         * chunk OOMs the MMQ pool mid-prefill. */
-        const uint64_t reserved = g_vram_plan.workspace +
-                                  g_vram_plan.workspace / 2u +
-                                  g_vram_plan.margin;
+         * chunk OOMs the MMQ pool mid-prefill.
+         *
+         * The margin, like the workspace terms, is a PREFILL reservation:
+         * once the workspace is trimmed those transients are gone, and
+         * keeping the margin would permanently refuse the tail of the
+         * resident model exactly where residency matters most (measured:
+         * ctx 131072 short-prompt decode 4.1-4.2 -> 1.66 t/s because the
+         * last 1.7 GiB could never be admitted and decode stayed on the
+         * per-layer staging path). At decode the arena's live-free clamp
+         * and the promote budget are the over-commit guards. */
+        const uint64_t reserved = g_vram_plan.workspace != 0
+            ? g_vram_plan.workspace + g_vram_plan.workspace / 2u +
+              g_vram_plan.margin
+            : 0;
         limit = limit > reserved ? limit - reserved : 0;
         return limit;
     }
@@ -3664,8 +3681,23 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
             const uint64_t keep = cuda_stream_stage_budget_bytes();
             const uint64_t usable =
                 (uint64_t)free_b > keep ? (uint64_t)free_b - keep : 0;
-            if (usable < aligned) return NULL;
-            if (chunk > usable) chunk = usable;
+            if (g_vram_plan.workspace != 0) {
+                /* Prefill: the chunk-scaled transients are live and hot;
+                 * an allocation past reported-free lands them in paging. */
+                if (usable < aligned) return NULL;
+                if (chunk > usable) chunk = usable;
+            } else {
+                /* Decode: the static limit already keeps cache + KV under
+                 * capacity, and reported-free undercounts by the driver's
+                 * cold transients. A mild allocation past free lets the
+                 * driver page those out and keep the weights hot — the
+                 * pre-plan behavior that measured 4.1-4.2 t/s at ctx
+                 * 131072, against 3.07 when the gap is re-staged per
+                 * token. Shrink the grain to the request so the trespass
+                 * is never larger than the tensor that needs it. */
+                if (usable < aligned) chunk = aligned;
+                else if (chunk > usable) chunk = usable;
+            }
         }
     }
     void *dev = NULL;
@@ -3891,16 +3923,21 @@ static void cuda_model_range_release_all(void);
  * must take the per-layer path, whose staging keeps re-offering spans to the
  * cache until the gap closes. Exact-offset lookups: caching is tensor-exact
  * on every path that feeds it. */
-extern "C" int ds4_gpu_stream_decode_needs_layer_staging(void) {
+static uint64_t cuda_resident_gap_bytes(void) {
     if (!g_ssd_streaming_mode || g_resident_spans.empty()) return 0;
+    uint64_t gap = 0;
     for (const auto &s : g_resident_spans) {
         auto exact = g_model_range_by_offset.find(s.first);
         if (exact == g_model_range_by_offset.end() ||
             g_model_ranges[exact->second].bytes < s.second) {
-            return 1;
+            gap += s.second;
         }
     }
-    return 0;
+    return gap;
+}
+
+extern "C" int ds4_gpu_stream_decode_needs_layer_staging(void) {
+    return cuda_resident_gap_bytes() != 0;
 }
 
 extern "C" void ds4_gpu_stream_weight_cache_release(void) {
