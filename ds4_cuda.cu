@@ -146,8 +146,67 @@ static uint64_t g_q8_f16_bytes;
  * pool (a prefill win). See ds4_gpu_plan_streaming_vram. */
 static struct {
     uint64_t spare;         /* capacity less every known commitment */
+    uint64_t margin;        /* one token's routed experts, see the plan fn */
+    uint64_t model_bytes;   /* the resident (non-routed) weight total: the
+                             * weight cache can never legitimately exceed it */
+    uint64_t workspace;     /* chunk-sized prefill activation workspace,
+                             * noted late — only a prompt's arrival sizes it */
     int      q8_f16_pool;   /* 1 if the pool is affordable */
+    int      valid;         /* a streamed plan was installed */
 } g_vram_plan;
+
+/* The non-routed spans that stay resident for a streamed run, kept so the
+ * weight cache can be re-warmed after the prefill workspace is trimmed.
+ * Given once at engine open; offsets/sizes are copied. */
+static const void *g_resident_spans_map;
+static uint64_t    g_resident_spans_model_size;
+static std::vector<std::pair<uint64_t, uint64_t>> g_resident_spans;
+
+/* Per-layer transient staging for the resident weights the bounded permanent
+ * cache cannot hold during prefill. Two slots rotated by layer parity: the
+ * streamed prefill is layer-serial with an end_commands sync per layer, so by
+ * the time layer il stages over slot il&1, layer il-2's kernels have
+ * completed and nothing reads the slab being overwritten. Without this,
+ * over-budget layers run their GEMMs on the SSD re-fetch path (measured 45x
+ * slower) or push the card into GPU-PV paging. */
+typedef struct {
+    uint64_t offset;
+    uint64_t bytes;
+    uint64_t dev_off;
+} cuda_layer_stage_entry;
+static struct cuda_layer_stage_slot {
+    char       *dev;
+    uint64_t    cap;
+    uint64_t    used;
+    const void *map;
+    std::vector<cuda_layer_stage_entry> entries;
+} g_layer_stage[2];
+
+static const char *cuda_layer_stage_find(const void *model_map,
+                                         uint64_t offset,
+                                         uint64_t end) {
+    for (int s = 0; s < 2; s++) {
+        const cuda_layer_stage_slot &slot = g_layer_stage[s];
+        if (slot.map != model_map || !slot.dev) continue;
+        for (const cuda_layer_stage_entry &e : slot.entries) {
+            if (offset >= e.offset && end <= e.offset + e.bytes) {
+                return slot.dev + e.dev_off + (offset - e.offset);
+            }
+        }
+    }
+    return NULL;
+}
+
+static void cuda_layer_stage_release_all(void) {
+    for (int s = 0; s < 2; s++) {
+        if (g_layer_stage[s].dev) (void)cudaFree(g_layer_stage[s].dev);
+        g_layer_stage[s].dev = NULL;
+        g_layer_stage[s].cap = 0;
+        g_layer_stage[s].used = 0;
+        g_layer_stage[s].map = NULL;
+        g_layer_stage[s].entries.clear();
+    }
+}
 
 typedef struct {
     int valid;
@@ -1557,6 +1616,14 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
         }
     }
 
+    {
+        /* Prefill layer staging: transient device copies of over-budget
+         * layers' weights, uploaded once per layer sweep. Counted under the
+         * CACHED exit — they are device-resident like a cache hit. */
+        const char *staged = cuda_layer_stage_find(model_map, offset, end);
+        if (staged) { cuda_range_exit_note(DS4_RANGE_EXIT_CACHED, bytes); return staged; }
+    }
+
     if (getenv("DS4_CUDA_NO_FD_CACHE") == NULL) {
         const char *fd_ptr = cuda_model_range_ptr_from_fd(model_map, offset, bytes, what);
         if (fd_ptr) { cuda_range_exit_note(DS4_RANGE_EXIT_FD, bytes); return fd_ptr; }
@@ -1803,6 +1870,12 @@ static cuda_decode_graph_entry *cuda_decode_graph_find(
 extern "C" int ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key) {
     if (!key || !ds4_gpu_decode_graphs_supported()) return -1;
     if (g_decode_graph_capturing) return -1;   /* no nesting */
+    /* Staged weight slabs rotate between layers; a captured graph would
+     * bake a slab pointer whose contents change under the replay. Stay
+     * eager until promotion has emptied the staging slots. */
+    if (!g_layer_stage[0].entries.empty() || !g_layer_stage[1].entries.empty()) {
+        return -1;
+    }
     cuda_decode_graph_entry *e = cuda_decode_graph_find(key);
     if (!e || e->state == 3) return -1;
     if (e->state == 0) {
@@ -2406,9 +2479,19 @@ extern "C" void ds4_gpu_plan_streaming_vram(uint64_t model_bytes,
      * still costs 3.80 -> 3.38 t/s. The pool is free where the plan shows slack
      * and expensive where it shows none; at the two contexts measured there was
      * no middle ground. */
+    /* The chunk-sized prefill activation workspace is a term of the same
+     * plan, but only a prompt's arrival sizes it, so it joins late through
+     * ds4_gpu_plan_note_prefill_workspace. A pool built against spare that
+     * the workspace is about to occupy OOMs the weight cache mid-prefill and
+     * every later layer's GEMMs drop to SSD re-fetch, so the pool must fit
+     * beside the workspace, not instead of it. */
+    g_vram_plan.margin = routed_working_set_bytes;
+    g_vram_plan.model_bytes = model_bytes;
+    g_vram_plan.valid = 1;
     g_vram_plan.q8_f16_pool =
         routed_working_set_bytes != 0 &&
-        g_vram_plan.spare >= routed_working_set_bytes;
+        g_vram_plan.spare >= g_vram_plan.margin &&
+        g_vram_plan.spare - g_vram_plan.margin >= g_vram_plan.workspace;
 
     /* Diagnostic override, so the two arms of that measurement stay reachable. */
     const char *env = getenv("DS4_CUDA_Q8_F16_PLAN");
@@ -2429,6 +2512,132 @@ extern "C" void ds4_gpu_plan_streaming_vram(uint64_t model_bytes,
             (double)g_vram_plan.spare / 1073741824.0,
             (double)routed_working_set_bytes / 1073741824.0,
             g_vram_plan.q8_f16_pool ? "built" : "declined");
+}
+
+extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
+
+extern "C" void ds4_gpu_plan_note_prefill_workspace(uint64_t workspace_bytes) {
+    if (workspace_bytes == g_vram_plan.workspace) return;
+    g_vram_plan.workspace = workspace_bytes;
+    if (!g_vram_plan.valid) return;   /* plan lands later and reads the note */
+    const char *env = getenv("DS4_CUDA_Q8_F16_PLAN");
+    if (env && env[0]) return;        /* diagnostic override wins */
+    const int affordable =
+        g_vram_plan.margin != 0 &&
+        g_vram_plan.spare >= g_vram_plan.margin &&
+        g_vram_plan.spare - g_vram_plan.margin >= g_vram_plan.workspace;
+    if (affordable || !g_vram_plan.q8_f16_pool) {
+        g_vram_plan.q8_f16_pool = affordable;
+        return;
+    }
+    /* The pool was affordable until this prompt's workspace arrived. Give
+     * the bytes back before the workspace claims them: the pool is a cache
+     * of dequantized copies, dropping it costs nothing but the next
+     * short-prompt rebuild. */
+    g_vram_plan.q8_f16_pool = 0;
+    if (g_q8_f16_bytes != 0) {
+        fprintf(stderr,
+                "ds4: CUDA q8->f16 weight pool released (%.2f GiB): "
+                "a %.2f GiB prefill workspace outranks it\n",
+                (double)g_q8_f16_bytes / 1073741824.0,
+                (double)workspace_bytes / 1073741824.0);
+        cuda_q8_f16_cache_release_all();
+    }
+}
+
+extern "C" void ds4_gpu_note_streaming_resident_spans(const void *model_map,
+                                                      uint64_t model_size,
+                                                      const uint64_t *offsets,
+                                                      const uint64_t *sizes,
+                                                      uint32_t count) {
+    g_resident_spans.clear();
+    g_resident_spans_map = model_map;
+    g_resident_spans_model_size = model_size;
+    if (!model_map || !offsets || !sizes) return;
+    g_resident_spans.reserve(count);
+    for (uint32_t i = 0; i < count; i++) {
+        if (sizes[i] == 0 || offsets[i] > model_size ||
+            sizes[i] > model_size - offsets[i]) continue;
+        g_resident_spans.push_back({offsets[i], sizes[i]});
+    }
+}
+
+extern "C" void ds4_gpu_stream_scratch_trimmed(void) {
+    if (!g_ssd_streaming_mode || g_n_gpus > 1) return;
+    /* Decode owns the workspace's bytes now: the cache limit derives from
+     * the live workspace, so zeroing it here is what lets the promotion
+     * below fill the cache to the full resident model. The transient layer
+     * slots are prefill-only — return their VRAM before promoting, along
+     * with the prefill-high-water scratch buffers (token-tile staging and
+     * the tmp ring), which re-grow on demand at decode's much smaller
+     * sizes. Same discipline as their own growth paths: quiesce, retire
+     * captured graphs, free. */
+    g_vram_plan.workspace = 0;
+    cuda_layer_stage_release_all();
+    if (cuda_ok(cudaDeviceSynchronize(), "synchronize before trim promote")) {
+        ds4_gpu_decode_graphs_invalidate();
+        if (g_cuda_tmp) {
+            (void)cudaFree(g_cuda_tmp);
+            g_cuda_tmp = NULL;
+            g_cuda_tmp_bytes = 0;
+        }
+        if (g_tt_scratch) {
+            (void)cudaFree(g_tt_scratch);
+            g_tt_scratch = NULL;
+            g_tt_scratch_bytes = 0;
+            g_tt_scratch_device = -1;
+        }
+    }
+    if (g_resident_spans.empty() || !g_resident_spans_map) return;
+    /* A mid-prefill OOM latches the weight cache shut so lookups stop paying
+     * a doomed cudaMalloc each. The trim just returned the workspace to the
+     * card, so the latch no longer describes reality. */
+    g_model_cache_full = 0;
+    /* Promote only into bytes the driver reports free right now, less the
+     * margin (the VRAM expert tier and decode transients live there). On
+     * WSL2 GPU-PV cudaMalloc happily allocates into paging debt — a promote
+     * loop that stops "when allocation fails" stops minutes too late
+     * (measured: 6.45 GiB promoted at ctx 16384, decode 0.46 t/s). Reading
+     * free at this settled boundary is not the mid-flight snapshot the plan
+     * comment forbids. */
+    uint64_t promote_budget = 0;
+    {
+        /* The floor is the loader's staging arena, the one decode-time
+         * consumer that still needs VRAM after this point. Anything larger
+         * (a full expert-tier reservation) is a bad trade: an unpromoted
+         * span costs its bytes over the bus EVERY token, deterministically,
+         * while the tier saves only its hit-rate's worth of the same. */
+        const uint64_t floor_b = cuda_stream_stage_budget_bytes();
+        size_t free_b = 0, total_b = 0;
+        if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess &&
+            (uint64_t)free_b > floor_b) {
+            promote_budget = (uint64_t)free_b - floor_b;
+        }
+    }
+    const uint64_t before = g_model_range_bytes;
+    for (const auto &s : g_resident_spans) {
+        if (cuda_model_range_is_cached(g_resident_spans_map, s.first, s.second)) {
+            continue;
+        }
+        if (g_model_range_bytes - before + s.second > promote_budget) break;
+        if (g_vram_plan.valid &&
+            g_model_range_bytes + s.second > g_vram_plan.model_bytes) {
+            break;
+        }
+        (void)ds4_gpu_cache_model_range(g_resident_spans_map,
+                                        g_resident_spans_model_size,
+                                        s.first, s.second, "trim promote");
+        if (g_model_cache_full) break;   /* card genuinely full: stop early */
+    }
+    if (g_model_range_bytes != before) {
+        fprintf(stderr,
+                "ds4: CUDA promoted %.2f GiB of resident weights into the "
+                "trimmed workspace's VRAM (weight cache %.2f GiB, "
+                "promote budget %.2f GiB)\n",
+                (double)(g_model_range_bytes - before) / 1073741824.0,
+                (double)g_model_range_bytes / 1073741824.0,
+                (double)promote_budget / 1073741824.0);
+    }
 }
 
 static int cuda_q8_f16_cache_allowed(const char *label, uint64_t in_dim, uint64_t out_dim) {
@@ -3379,8 +3588,32 @@ static uint64_t cuda_model_cache_limit_bytes(void) {
         unsigned long long v = strtoull(env, &end, 10);
         if (end != env) gb = (uint64_t)v;
     }
-    if (gb == 0) return UINT64_MAX;
-    return gb * 1073741824ull;
+    if (gb != 0) return gb * 1073741824ull;
+    /* Under a streamed plan the cache is bounded by what the card holds
+     * beside the other planned commitments. spare already subtracted the
+     * whole resident model, so capacity-less-KV-buffers-streaming is
+     * spare + model; the live prefill workspace and the transient margin
+     * come off that. Unbounded greed here is what over-commits WSL2 GPU-PV
+     * into paging (cudaMalloc does not refuse) and latches the cache shut
+     * mid-prefill on real OOM — both measured, both this line's job to
+     * prevent. Outside a streamed plan the historical unbounded behavior
+     * stands. */
+    if (g_ssd_streaming_mode && g_vram_plan.valid) {
+        uint64_t limit = g_vram_plan.spare + g_vram_plan.model_bytes;
+        /* workspace/2 stands in for the chunk-scaled prefill transients the
+         * margin cannot see: the MMQ activation pool, the attention-output
+         * GEMM scratch and the token-tile mirrors together measure ~0.5
+         * MiB/row against the workspace's ~1 MiB/row (ctx 16384, chunk
+         * 4096: ~2 GiB beside a 4 GiB workspace). Without this term the
+         * cache fills the room those allocations need and the first big
+         * chunk OOMs the MMQ pool mid-prefill. */
+        const uint64_t reserved = g_vram_plan.workspace +
+                                  g_vram_plan.workspace / 2u +
+                                  g_vram_plan.margin;
+        limit = limit > reserved ? limit - reserved : 0;
+        return limit;
+    }
+    return UINT64_MAX;
 }
 
 static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
@@ -3419,7 +3652,22 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
     const uint64_t limit = cuda_model_cache_limit_bytes();
     if (g_model_range_bytes > limit || aligned > limit - g_model_range_bytes) return NULL;
 
-    const uint64_t chunk = cuda_model_arena_chunk_bytes(aligned);
+    uint64_t chunk = cuda_model_arena_chunk_bytes(aligned);
+    /* The 1.75 GiB amortization grain is wrong twice near the end of the
+     * budget: it can refuse a small tensor that would fit, and on WSL2
+     * GPU-PV an oversized chunk lands in paging over-commit instead of
+     * failing. Clamp the grain to what the driver reports free, less the
+     * loader's staging arena — the one consumer that must keep its room. */
+    if (g_ssd_streaming_mode && g_vram_plan.valid) {
+        size_t free_b = 0, total_b = 0;
+        if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
+            const uint64_t keep = cuda_stream_stage_budget_bytes();
+            const uint64_t usable =
+                (uint64_t)free_b > keep ? (uint64_t)free_b - keep : 0;
+            if (usable < aligned) return NULL;
+            if (chunk > usable) chunk = usable;
+        }
+    }
     void *dev = NULL;
     cudaError_t err = cudaMalloc(&dev, (size_t)chunk);
     if (err != cudaSuccess) {
@@ -3440,6 +3688,80 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
                 (double)arena_bytes / 1073741824.0);
     }
     return (char *)dev;
+}
+
+/* Read [offset, offset+bytes) of the model file into device memory at dev
+ * through the pinned staging ring: pipelined pread + async H2D, one final
+ * sync. Shared by the permanent FD cache and the per-layer prefill staging.
+ * note_progress feeds the load-progress banner (permanent cache only). */
+static int cuda_model_fd_copy_to_device(const void *model_map,
+                                        uint64_t offset,
+                                        uint64_t bytes,
+                                        char *dev,
+                                        const char *what,
+                                        int note_progress) {
+    cudaError_t err = cudaSuccess;
+    const uint64_t chunk = cuda_model_copy_chunk_bytes();
+    const uint64_t stage_bytes = chunk + (g_model_direct_align > 1 ? g_model_direct_align : 1);
+    if (!cuda_model_stage_pool_alloc(stage_bytes)) return 0;
+
+    uint64_t copied = 0;
+    uint64_t chunk_idx = 0;
+    while (copied < bytes) {
+        const uint64_t n = (bytes - copied < chunk) ? (bytes - copied) : chunk;
+        const uint64_t bi = chunk_idx % 4u;
+        if (chunk_idx >= 4u) {
+            err = cudaEventSynchronize(g_model_stage_event[bi]);
+            if (err != cudaSuccess) {
+                fprintf(stderr, "ds4: CUDA model staging wait failed for %s: %s\n",
+                        what ? what : "weights", cudaGetErrorString(err));
+                (void)cudaGetLastError();
+                return 0;
+            }
+        }
+        const char *payload = NULL;
+        if (!cuda_model_stage_read(g_model_stage[bi], g_model_stage_bytes,
+                                   offset + copied, n, &payload)) {
+            fprintf(stderr, "ds4: CUDA model range read failed for %s at %.2f MiB: %s\n",
+                    what ? what : "weights",
+                    (double)copied / 1048576.0,
+                    strerror(errno));
+            return 0;
+        }
+        err = cudaMemcpyAsync(dev + copied, payload, (size_t)n,
+                              cudaMemcpyHostToDevice, g_model_upload_stream);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "ds4: CUDA model range copy failed for %s at %.2f MiB: %s\n",
+                    what ? what : "weights",
+                    (double)copied / 1048576.0,
+                    cudaGetErrorString(err));
+            (void)cudaGetLastError();
+            return 0;
+        }
+        err = cudaEventRecord(g_model_stage_event[bi], g_model_upload_stream);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "ds4: CUDA model staging record failed for %s: %s\n",
+                    what ? what : "weights", cudaGetErrorString(err));
+            (void)cudaGetLastError();
+            return 0;
+        }
+        cuda_model_drop_file_pages(offset + copied, n);
+        cuda_model_discard_source_pages(model_map, g_model_registered_size, offset + copied, n);
+        g_model_range_h2d_bytes += n;
+        copied += n;
+        if (note_progress) {
+            cuda_model_load_progress_note(g_model_range_bytes + copied);
+        }
+        chunk_idx++;
+    }
+    err = cudaStreamSynchronize(g_model_upload_stream);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4: CUDA model range upload sync failed for %s: %s\n",
+                what ? what : "weights", cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+    return 1;
 }
 
 static const char *cuda_model_range_ptr_from_fd(
@@ -3465,64 +3787,7 @@ static const char *cuda_model_range_ptr_from_fd(
         if (getenv("DS4_CUDA_STRICT_WEIGHT_CACHE") != NULL) return NULL;
         return cuda_model_ptr(model_map, offset);
     }
-    cudaError_t err = cudaSuccess;
-
-    const uint64_t chunk = cuda_model_copy_chunk_bytes();
-    const uint64_t stage_bytes = chunk + (g_model_direct_align > 1 ? g_model_direct_align : 1);
-    if (!cuda_model_stage_pool_alloc(stage_bytes)) return NULL;
-
-    uint64_t copied = 0;
-    uint64_t chunk_idx = 0;
-    while (copied < bytes) {
-        const uint64_t n = (bytes - copied < chunk) ? (bytes - copied) : chunk;
-        const uint64_t bi = chunk_idx % 4u;
-        if (chunk_idx >= 4u) {
-            err = cudaEventSynchronize(g_model_stage_event[bi]);
-            if (err != cudaSuccess) {
-                fprintf(stderr, "ds4: CUDA model staging wait failed for %s: %s\n",
-                        what ? what : "weights", cudaGetErrorString(err));
-                (void)cudaGetLastError();
-                return NULL;
-            }
-        }
-        const char *payload = NULL;
-        if (!cuda_model_stage_read(g_model_stage[bi], g_model_stage_bytes,
-                                   offset + copied, n, &payload)) {
-            fprintf(stderr, "ds4: CUDA model range read failed for %s at %.2f MiB: %s\n",
-                    what ? what : "weights",
-                    (double)copied / 1048576.0,
-                    strerror(errno));
-            return NULL;
-        }
-        err = cudaMemcpyAsync(dev + copied, payload, (size_t)n,
-                              cudaMemcpyHostToDevice, g_model_upload_stream);
-        if (err != cudaSuccess) {
-            fprintf(stderr, "ds4: CUDA model range copy failed for %s at %.2f MiB: %s\n",
-                    what ? what : "weights",
-                    (double)copied / 1048576.0,
-                    cudaGetErrorString(err));
-            (void)cudaGetLastError();
-            return NULL;
-        }
-        err = cudaEventRecord(g_model_stage_event[bi], g_model_upload_stream);
-        if (err != cudaSuccess) {
-            fprintf(stderr, "ds4: CUDA model staging record failed for %s: %s\n",
-                    what ? what : "weights", cudaGetErrorString(err));
-            (void)cudaGetLastError();
-            return NULL;
-        }
-        cuda_model_drop_file_pages(offset + copied, n);
-        cuda_model_discard_source_pages(model_map, g_model_registered_size, offset + copied, n);
-        g_model_range_h2d_bytes += n;
-        copied += n;
-        cuda_model_load_progress_note(g_model_range_bytes + copied);
-        chunk_idx++;
-    }
-    err = cudaStreamSynchronize(g_model_upload_stream);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "ds4: CUDA model range upload sync failed for %s: %s\n",
-                what ? what : "weights", cudaGetErrorString(err));
-        (void)cudaGetLastError();
+    if (!cuda_model_fd_copy_to_device(model_map, offset, bytes, dev, what, 1)) {
         return NULL;
     }
 
@@ -3537,6 +3802,118 @@ static const char *cuda_model_range_ptr_from_fd(
                 (double)g_model_range_bytes / 1073741824.0);
     }
     return (const char *)dev;
+}
+
+/* Stage one prefill layer's resident weights on the device. Per span, in
+ * order of preference: already served by the permanent cache (nothing to
+ * do), admitted into the permanent cache (uploaded once for the whole run),
+ * else uploaded into this layer's transient slot. Failure to stage leaves
+ * the span on the direct path — slower, never wrong. */
+extern "C" int ds4_gpu_stage_prefill_layer_spans(const void *model_map,
+                                                 uint64_t model_size,
+                                                 const uint64_t *offsets,
+                                                 const uint64_t *sizes,
+                                                 uint32_t count,
+                                                 uint32_t slot_index) {
+    if (!g_ssd_streaming_mode || g_n_gpus > 1 || g_model_fd < 0) return 1;
+    if (!model_map || !offsets || !sizes || count == 0) return 1;
+    cuda_layer_stage_slot &slot = g_layer_stage[slot_index & 1u];
+    slot.entries.clear();
+    slot.used = 0;
+    slot.map = model_map;
+
+    uint64_t need = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        if (sizes[i] == 0 || offsets[i] > model_size ||
+            sizes[i] > model_size - offsets[i]) continue;
+        if (cuda_model_range_is_cached(model_map, offsets[i], sizes[i])) continue;
+        if (!g_model_cache_full &&
+            ds4_gpu_cache_model_range(model_map, model_size,
+                                      offsets[i], sizes[i], "prefill layer")) {
+            continue;
+        }
+        need += (sizes[i] + 255u) & ~255ull;
+    }
+    if (need == 0) return 1;
+
+    if (slot.cap < need) {
+        /* Need-sized, grown in 64 MiB grains. The arena's live brake keeps
+         * this malloc inside genuinely free VRAM — a cudaMalloc against a
+         * packed card spins for minutes under WSL2 GPU-PV (measured at ctx
+         * 16384), and an over-sized permanent slot pushes the expert layer
+         * buffers into paging instead (measured: routed_moe 4x slower). */
+        if (slot.dev) (void)cudaFree(slot.dev);
+        slot.dev = NULL;
+        slot.cap = 0;
+        const uint64_t grain = 64ull * 1048576ull;
+        const uint64_t cap = (need + grain - 1u) & ~(grain - 1u);
+        void *dev = NULL;
+        if (cudaMalloc(&dev, (size_t)cap) != cudaSuccess) {
+            (void)cudaGetLastError();
+            static int noted = 0;
+            if (!noted) {
+                noted = 1;
+                fprintf(stderr,
+                        "ds4: CUDA prefill layer staging disabled "
+                        "(%.0f MiB slot refused); over-budget layers take "
+                        "the direct path\n",
+                        (double)cap / 1048576.0);
+            }
+            return 1;
+        }
+        slot.dev = (char *)dev;
+        slot.cap = cap;
+    }
+
+    for (uint32_t i = 0; i < count; i++) {
+        if (sizes[i] == 0 || offsets[i] > model_size ||
+            sizes[i] > model_size - offsets[i]) continue;
+        if (cuda_model_range_is_cached(model_map, offsets[i], sizes[i])) continue;
+        if (cuda_layer_stage_find(model_map, offsets[i], offsets[i] + sizes[i])) continue;
+        const uint64_t aligned = (sizes[i] + 255u) & ~255ull;
+        if (slot.used + aligned > slot.cap) break;
+        if (!cuda_model_fd_copy_to_device(model_map, offsets[i], sizes[i],
+                                          slot.dev + slot.used,
+                                          "prefill layer stage", 0)) {
+            return 0;
+        }
+        slot.entries.push_back({offsets[i], sizes[i], slot.used});
+        slot.used += aligned;
+    }
+    return 1;
+}
+
+static void cuda_model_range_release_all(void);
+
+/* True while any registered resident span is not in the permanent weight
+ * cache. The batched decode encoder queues all 43 layers under one sync, so
+ * the 2-slot staging rotation cannot serve it; while a gap exists decode
+ * must take the per-layer path, whose staging keeps re-offering spans to the
+ * cache until the gap closes. Exact-offset lookups: caching is tensor-exact
+ * on every path that feeds it. */
+extern "C" int ds4_gpu_stream_decode_needs_layer_staging(void) {
+    if (!g_ssd_streaming_mode || g_resident_spans.empty()) return 0;
+    for (const auto &s : g_resident_spans) {
+        auto exact = g_model_range_by_offset.find(s.first);
+        if (exact == g_model_range_by_offset.end() ||
+            g_model_ranges[exact->second].bytes < s.second) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+extern "C" void ds4_gpu_stream_weight_cache_release(void) {
+    if (!g_ssd_streaming_mode) return;
+    /* Captured decode-island graphs bake weight-range pointers into their
+     * kernel nodes; retire them before the ranges go away. */
+    ds4_gpu_decode_graphs_invalidate();
+    cuda_layer_stage_release_all();
+    cuda_model_range_release_all();
+    g_model_cache_full = 0;
+    fprintf(stderr,
+            "ds4: CUDA weight cache released so the prefill workspace can "
+            "grow back; the next layer sweep re-fills it\n");
 }
 
 static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size) {

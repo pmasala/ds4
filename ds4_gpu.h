@@ -135,11 +135,59 @@ void ds4_gpu_plan_streaming_vram(uint64_t model_bytes,
                                  uint64_t stream_bytes,
                                  uint64_t routed_working_set_bytes);
 
+/* The prefill activation workspace is chunk-sized and only knowable when a
+ * prompt arrives, so it joins the plan late: called before the workspace
+ * grows, with the bytes it will occupy. The accelerator re-decides the
+ * optional consumers that must not coexist with it — on a card where the
+ * pool plus a chunk-sized workspace oversubscribe VRAM, building the pool
+ * mid-prefill OOMs the weight cache and every later layer's GEMMs run on
+ * SSD re-fetch (measured 45x slower). */
+void ds4_gpu_plan_note_prefill_workspace(uint64_t workspace_bytes);
+
+/* The non-routed spans that stay resident for the whole streamed run, given
+ * once at engine open so the accelerator can re-warm its weight cache after
+ * VRAM pressure ends. The accelerator copies the arrays. */
+void ds4_gpu_note_streaming_resident_spans(const void *model_map,
+                                           uint64_t model_size,
+                                           const uint64_t *offsets,
+                                           const uint64_t *sizes,
+                                           uint32_t count);
+
 /* The graph's chunk-sized prefill scratch trims itself at the first streamed
  * decode token so the VRAM expert tier can absorb the freed bytes, and grows
  * back for the next prefill chunk. A re-grow that finds the tier sitting on
  * those bytes may reclaim its slab — it is a cache, dropping it is safe. */
 void ds4_gpu_stream_vram_tier_release(void);
+
+/* The trim above just returned chunk-sized VRAM to the card. Re-open the
+ * weight cache (a mid-prefill OOM latches it shut) and promote whatever
+ * resident spans it had to leave on the host, so decode never pays the SSD
+ * re-fetch path for backbone weights. Runs before the VRAM expert tier
+ * sizes itself from free memory, deterministic bytes first. */
+void ds4_gpu_stream_scratch_trimmed(void);
+
+/* Stage one prefill layer's resident weights on the device before its
+ * GEMMs encode: spans the bounded permanent cache holds are skipped, spans
+ * it can still admit are cached permanently, the rest land in a transient
+ * per-parity slot rotated by the layer-serial sweep. Tensor-exact ranges,
+ * unmerged. Returns 0 only on an upload failure. */
+int ds4_gpu_stage_prefill_layer_spans(const void *model_map,
+                                      uint64_t model_size,
+                                      const uint64_t *offsets,
+                                      const uint64_t *sizes,
+                                      uint32_t count,
+                                      uint32_t slot_index);
+
+/* Last-resort room-maker for a prefill workspace re-grow: drop the whole
+ * weight cache (and the transient layer slots) after retiring captured
+ * decode graphs. Safe only between prompts, when no kernels are in flight;
+ * the next layer sweep re-fills the cache within its budget. */
+void ds4_gpu_stream_weight_cache_release(void);
+
+/* True while some resident span is still outside the weight cache. The
+ * batched decode encoder (one sync for all layers) cannot use the rotating
+ * staging slots, so decode takes the per-layer path until this clears. */
+int ds4_gpu_stream_decode_needs_layer_staging(void);
 #ifdef DS4_ROCM_BUILD
 void ds4_gpu_release_q8_f16_cache(void);
 #endif

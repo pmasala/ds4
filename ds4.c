@@ -19582,6 +19582,69 @@ static bool metal_graph_stream_map_decode_static_all(
     return ok;
 }
 
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+/* The output head must be device-resident like any layer's weights: a
+ * bounded weight cache may not have admitted it, and the direct mmap
+ * pointer is not kernel-readable under streaming. Tensor-exact, unmerged
+ * (see metal_graph_cuda_stage_layer_weights below). Slot 1 is free here:
+ * the head runs after the last layer's end_commands on every path. */
+static void metal_graph_cuda_stage_output_head_weights(
+        const ds4_model   *model,
+        const ds4_weights *weights) {
+    ds4_model_map_span_vec head;
+    memset(&head, 0, sizeof(head));
+    model_map_span_vec_include_output(&head, weights);
+    if (head.len != 0) {
+        uint64_t *offsets = xmalloc((size_t)head.len * sizeof(offsets[0]));
+        uint64_t *sizes = xmalloc((size_t)head.len * sizeof(sizes[0]));
+        for (uint32_t i = 0; i < head.len; i++) {
+            offsets[i] = head.v[i].off;
+            sizes[i] = head.v[i].end - head.v[i].off;
+        }
+        (void)ds4_gpu_stage_prefill_layer_spans(model->map,
+                                                model->size,
+                                                offsets,
+                                                sizes,
+                                                head.len,
+                                                1u);
+        free(offsets);
+        free(sizes);
+    }
+    free(head.v);
+}
+
+/* Stage layer il's resident (non-routed) weights on the device before its
+ * prefill GEMMs encode. Tensor-exact, unmerged ranges: the accelerator keys
+ * cached ranges by the offsets kernels request. The accelerator decides per
+ * span whether the permanent cache already holds it, can still admit it, or
+ * a transient slot must carry it for this sweep. */
+static void metal_graph_cuda_stage_layer_weights(
+        const ds4_model   *model,
+        const ds4_weights *weights,
+        uint32_t           il) {
+    ds4_model_map_span_vec spans;
+    memset(&spans, 0, sizeof(spans));
+    model_map_span_vec_include_layer_decode(&spans, weights, il);
+    if (spans.len != 0) {
+        uint64_t *offsets = xmalloc((size_t)spans.len * sizeof(offsets[0]));
+        uint64_t *sizes = xmalloc((size_t)spans.len * sizeof(sizes[0]));
+        for (uint32_t i = 0; i < spans.len; i++) {
+            offsets[i] = spans.v[i].off;
+            sizes[i] = spans.v[i].end - spans.v[i].off;
+        }
+        (void)ds4_gpu_stage_prefill_layer_spans(model->map,
+                                                model->size,
+                                                offsets,
+                                                sizes,
+                                                spans.len,
+                                                il & 1u);
+        free(offsets);
+        free(sizes);
+    }
+    free(spans.v);
+}
+#endif
+
 static bool metal_graph_stream_map_layer(
         const ds4_model   *model,
         const ds4_weights *weights,
@@ -19620,6 +19683,9 @@ static bool metal_graph_stream_map_output(
     }
     const bool ok = metal_graph_install_model_spans(model, &spans, "output head");
     free(spans.v);
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (ok) metal_graph_cuda_stage_output_head_weights(model, weights);
+#endif
     return ok;
 }
 
@@ -21934,13 +22000,36 @@ static bool metal_graph_prefill_scratch_resize(ds4_gpu_graph *g,
         ok = metal_graph_prefill_batch_scratch_alloc(g, rows) &&
              metal_graph_indexer_scratch_alloc(g, rows);
     }
+    if (!ok && g->ssd_streaming && rows > 1u) {
+        /* Still no room: the promoted weight cache holds the bytes the last
+         * trim freed. It too is a cache — drop it, grow the workspace, and
+         * let the coming layer sweep re-fill it within its budget. */
+        ds4_gpu_stream_weight_cache_release();
+        ok = metal_graph_prefill_batch_scratch_alloc(g, rows) &&
+             metal_graph_indexer_scratch_alloc(g, rows);
+    }
 #endif
     if (!ok) return false;
     const uint64_t bytes_after = metal_graph_prefill_scratch_bytes(g);
     fprintf(stderr, "ds4: prefill scratch resized %u -> %u rows (%+.2f GiB)\n",
             g->prefill_scratch_rows, rows,
             ((double)bytes_after - (double)bytes_before) / 1073741824.0);
+    const bool trimmed = rows == 1u && g->prefill_scratch_rows > 1u;
     g->prefill_scratch_rows = rows;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (g->ssd_streaming) {
+        if (trimmed) {
+            /* The workspace just went back to the card: promote whatever
+             * resident weights a mid-prefill OOM left on the host, before
+             * the VRAM expert tier sizes itself from free memory. */
+            ds4_gpu_stream_scratch_trimmed();
+        } else if (rows > 1u) {
+            ds4_gpu_plan_note_prefill_workspace(bytes_after);
+        }
+    }
+#else
+    (void)trimmed;
+#endif
     return true;
 }
 
@@ -30735,8 +30824,19 @@ static bool metal_graph_eval_token_raw_swa_streaming(
     const bool static_decode_map = metal_graph_stream_decode_static_map_enabled();
     const bool static_map_state_cache =
         static_decode_map && metal_graph_stream_decode_static_map_state_cache_enabled();
-    const bool batch_static_decode =
+    bool batch_static_decode =
         static_decode_map && metal_graph_stream_decode_layer_batch_enabled(g);
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    /* The batched encoder queues all layers under one sync, which the
+     * rotating weight-staging slots cannot serve. While the weight cache
+     * has not absorbed every resident span, take the per-layer path — its
+     * staging covers the gap and keeps re-offering spans to the cache, so
+     * this reverts to the batched encoder once promotion converges. */
+    if (batch_static_decode && g->ssd_streaming &&
+        ds4_gpu_stream_decode_needs_layer_staging()) {
+        batch_static_decode = false;
+    }
+#endif
     bool ok = true;
     if (static_decode_map) {
         if (!static_map_state_cache || !g->streaming_static_decode_map_current) {
@@ -30820,6 +30920,17 @@ static bool metal_graph_eval_token_raw_swa_streaming(
             ok = false;
             break;
         }
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+        /* Same total-coverage rule as prefill: any resident span the bounded
+         * cache does not hold must be device-staged before its GEMVs encode —
+         * the direct mmap pointer is not kernel-readable under streaming.
+         * All-promoted layers make this a no-op; partially promoted ones
+         * convert to cached ranges over the first few tokens as the staging
+         * helper re-offers each span to the cache. */
+        if (g->ssd_streaming) {
+            metal_graph_cuda_stage_layer_weights(model, weights, il);
+        }
+#endif
         if (!static_decode_map && il + 1 < DS4_N_LAYER) {
             metal_graph_stream_readahead_layer_decode(model, weights, il + 1);
         } else if (!static_decode_map && logits) {
@@ -30856,6 +30967,13 @@ static bool metal_graph_eval_token_raw_swa_streaming(
     }
 
     if (ok && logits && !static_decode_map) ok = metal_graph_stream_map_output(model, weights);
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    /* With the static decode map the map_output call above is skipped, but
+     * the output head still needs the same total staging coverage. */
+    if (ok && logits && static_decode_map && g->ssd_streaming) {
+        metal_graph_cuda_stage_output_head_weights(model, weights);
+    }
+#endif
     const double t_head0 = profile ? now_sec() : 0.0;
     if (ok && logits) ok = ds4_gpu_begin_commands() != 0;
     if (ok && logits) ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
@@ -35013,6 +35131,9 @@ static bool metal_graph_prefill_layer_major(
                 ok = false;
                 break;
             }
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+            metal_graph_cuda_stage_layer_weights(model, weights, il);
+#endif
         }
         if (g->ssd_streaming) {
             if (layer_prepare && layer_prepare_overlap) {
@@ -35350,6 +35471,14 @@ static bool metal_graph_prefill_layer_major(
     if (!metal_graph_seed_streaming_expert_cache_from_prefill(g, model, weights)) {
         return false;
     }
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    /* This path encodes the output head without a map_output call, so give
+     * the head weights the same staging the layers got: a bounded cache may
+     * have left them on the host, where kernels cannot read them. */
+    if (g->ssd_streaming && logits) {
+        metal_graph_cuda_stage_output_head_weights(model, weights);
+    }
+#endif
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     uint32_t output_row = tail_rows - 1u;
@@ -37390,6 +37519,40 @@ static void ds4_engine_plan_startup_memory(
                 ds4_add_sat_u64(e->ssd_streaming_full_layer_bytes,
                                 expert_reserved_bytes),
                 per_expert_bytes * DS4_N_LAYER * DS4_N_EXPERT_USED);
+        /* The same tensors the resident-model term was sized from, handed
+         * over so the accelerator can re-warm its weight cache once the
+         * prefill workspace is trimmed (ds4_gpu_stream_scratch_trimmed).
+         * Per-tensor and UNMERGED on purpose: the accelerator keys cached
+         * ranges by the offsets kernels request, which are tensor-exact —
+         * merged spans fail its dedupe and re-upload the whole model
+         * (measured: a 16.4 GiB weight cache on a 12 GiB card). */
+        ds4_model_map_span_vec spans;
+        memset(&spans, 0, sizeof(spans));
+        if (weights_layer_has_required(&e->weights.layer[0], 0)) {
+            model_map_span_vec_include_one(&spans, e->weights.token_embd);
+        }
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            model_map_span_vec_include_layer_decode(&spans, &e->weights, il);
+        }
+        if (weights_have_output_head(&e->weights)) {
+            model_map_span_vec_include_output(&spans, &e->weights);
+        }
+        if (spans.len != 0) {
+            uint64_t *offsets = xmalloc((size_t)spans.len * sizeof(offsets[0]));
+            uint64_t *sizes = xmalloc((size_t)spans.len * sizeof(sizes[0]));
+            for (uint32_t i = 0; i < spans.len; i++) {
+                offsets[i] = spans.v[i].off;
+                sizes[i] = spans.v[i].end - spans.v[i].off;
+            }
+            ds4_gpu_note_streaming_resident_spans(e->model.map,
+                                                  e->model.size,
+                                                  offsets,
+                                                  sizes,
+                                                  spans.len);
+            free(offsets);
+            free(sizes);
+        }
+        free(spans.v);
     }
 #endif
 }
@@ -49096,6 +49259,11 @@ static int generate_metal_graph_raw_swa(
     /* CLI one-shot graph: same trim eligibility the session path grants —
      * CUDA SSD streaming, and no DSpark on this call site. */
     g.prefill_scratch_trim_ok = ssd_streaming;
+    /* The workspace was just allocated at prompt size: let the VRAM plan
+     * re-decide the optional consumers that must leave it room. */
+    if (ssd_streaming) {
+        ds4_gpu_plan_note_prefill_workspace(metal_graph_prefill_scratch_bytes(&g));
+    }
 #endif
     g.power_percent = power_percent > 0 ? (uint32_t)power_percent : 100u;
     if (!metal_graph_load_directional_steering(&g,
@@ -59288,6 +59456,14 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
      * full allocation. */
     s->graph.prefill_scratch_trim_ok =
         e->backend == DS4_BACKEND_CUDA && e->ssd_streaming && !e->dspark;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    /* Session graphs allocate the workspace at the session prefill cap: let
+     * the VRAM plan re-decide the optional consumers that must leave it room. */
+    if (e->backend == DS4_BACKEND_CUDA && e->ssd_streaming) {
+        ds4_gpu_plan_note_prefill_workspace(
+                metal_graph_prefill_scratch_bytes(&s->graph));
+    }
+#endif
     if (e->share_session_prefill_workspace &&
         !e->shared_prefill_workspace_ready) {
         bool workspace_ok = true;
