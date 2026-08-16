@@ -3623,10 +3623,20 @@ static uint64_t cuda_model_cache_limit_bytes(void) {
          * last 1.7 GiB could never be admitted and decode stayed on the
          * per-layer staging path). At decode the arena's live-free clamp
          * and the promote budget are the over-commit guards. */
-        const uint64_t reserved = g_vram_plan.workspace != 0
-            ? g_vram_plan.workspace + g_vram_plan.workspace / 2u +
-              g_vram_plan.margin
-            : 0;
+        /* The whole bounding machinery only earns its keep on LONG
+         * prefills: what over-commit costs is paging inside the layer
+         * sweeps, and that cost scales with the sweep count times the
+         * chunk rows — i.e. with the workspace. A short prompt's prefill
+         * is over before paging matters, and any reservation there
+         * permanently evicts residency the decode then pays for every
+         * token (measured at ctx 131072 short-prompt: 3.15-3.19 t/s
+         * bounded vs 5.30 with the historical greedy fill). Below one
+         * margin's worth of workspace the plan steps aside entirely —
+         * the staging layer stays armed underneath as the safety net. */
+        if (g_vram_plan.workspace < g_vram_plan.margin) return UINT64_MAX;
+        const uint64_t reserved = g_vram_plan.workspace +
+                                  g_vram_plan.workspace / 2u +
+                                  g_vram_plan.margin;
         limit = limit > reserved ? limit - reserved : 0;
         return limit;
     }
@@ -3681,12 +3691,16 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
             const uint64_t keep = cuda_stream_stage_budget_bytes();
             const uint64_t usable =
                 (uint64_t)free_b > keep ? (uint64_t)free_b - keep : 0;
-            if (g_vram_plan.workspace != 0) {
-                /* Prefill: the chunk-scaled transients are live and hot;
-                 * an allocation past reported-free lands them in paging. */
+            if (g_vram_plan.workspace >= g_vram_plan.margin) {
+                /* Long prefill: the chunk-scaled transients are live and
+                 * hot; an allocation past reported-free lands them in
+                 * paging for thousands of layer sweeps. Short prefills
+                 * (workspace below one margin) skip clamping entirely —
+                 * the historical greedy fill measured 5.30 t/s at ctx
+                 * 131072 against 3.19 for any bounded variant. */
                 if (usable < aligned) return NULL;
                 if (chunk > usable) chunk = usable;
-            } else {
+            } else if (g_vram_plan.workspace == 0) {
                 /* Decode: the static limit already keeps cache + KV under
                  * capacity, and reported-free undercounts by the driver's
                  * cold transients. A mild allocation past free lets the
